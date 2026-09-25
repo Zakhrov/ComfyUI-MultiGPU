@@ -14,6 +14,26 @@ import comfy.model_patcher
 from .device_utils import get_device_list
 from .model_management_mgpu import multigpu_memory_log
 
+_HIP_SOFTWARE_GEMM_ARCHITECTURES = frozenset(
+    {
+        "gfx900",
+        "gfx906",
+        "gfx90c",
+        "gfx1010",
+        "gfx1011",
+        "gfx1012",
+        "gfx1030",
+        "gfx1031",
+        "gfx1032",
+        "gfx1033",
+        "gfx1034",
+        "gfx1035",
+        "gfx1036",
+    }
+)
+_HIP_DONOR_GEMM_MAX_WEIGHT_BYTES = 16 * 1024 * 1024
+_HIP_DONOR_GEMM_EXECUTION_MODES = ("mixed", "all")
+
 
 def unpack_load_item(item):
     """Handle ComfyUI 0.6.0+ 5-tuple vs legacy 4-tuple"""
@@ -22,6 +42,183 @@ def unpack_load_item(item):
         return item[1], item[2], item[3], item[4]
     # (module_mem, module_name, module_object, params)
     return item[0], item[1], item[2], item[3]
+
+
+def _move_tensors(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, tuple):
+        return tuple(_move_tensors(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_tensors(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_tensors(item, device) for key, item in value.items()}
+    return value
+
+
+def _is_hip_software_gemm_device(device):
+    device = torch.device(device)
+    if (
+        not getattr(torch.version, "hip", None)
+        or device.type != "cuda"
+        or device.index is None
+    ):
+        return False
+
+    try:
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+    except (AttributeError, RuntimeError):
+        return False
+    return arch in _HIP_SOFTWARE_GEMM_ARCHITECTURES
+
+
+def _is_eligible_donor_gemm(module, execution_mode):
+    weight = getattr(module, "weight", None)
+    return isinstance(weight, torch.Tensor) and weight.ndim == 2
+
+
+def _is_large_donor_gemm(module):
+    weight = module.weight
+    return weight.numel() * weight.element_size() > _HIP_DONOR_GEMM_MAX_WEIGHT_BYTES
+
+
+def _can_tile_linear_on_compute(module):
+    weight = module.weight
+    return (
+        isinstance(module, torch.nn.Linear)
+        and weight.ndim == 2
+        and not hasattr(weight, "tensor_type")
+        and weight.shape == (module.out_features, module.in_features)
+    )
+
+
+def _run_tiled_linear_on_compute(input_tensor, module, compute_device):
+    """Stream a donor linear weight to the compute GPU by output-channel tiles."""
+    weight = module.weight
+    rows_per_tile = max(
+        1, _HIP_DONOR_GEMM_MAX_WEIGHT_BYTES // (weight.shape[1] * weight.element_size())
+    )
+    compute_input = input_tensor.to(device=compute_device)
+    output_tiles = []
+    bias = getattr(module, "bias", None)
+
+    for start in range(0, weight.shape[0], rows_per_tile):
+        end = min(start + rows_per_tile, weight.shape[0])
+        weight_tile = weight[start:end].to(
+            device=compute_device, dtype=compute_input.dtype
+        )
+        bias_tile = (
+            bias[start:end].to(device=compute_device, dtype=compute_input.dtype)
+            if isinstance(bias, torch.Tensor)
+            else None
+        )
+        output_tiles.append(
+            torch.nn.functional.linear(compute_input, weight_tile, bias_tile)
+        )
+
+    return torch.cat(output_tiles, dim=-1)
+
+
+def configure_hip_donor_gemm_offload(
+    module, compute_device, donor_device, execution_mode="mixed"
+):
+    """Run an eligible donor-assigned software-GEMM module on its donor GPU."""
+    original_forward = getattr(module, "_mgpu_original_forward", None)
+    compute_device = torch.device(compute_device)
+    donor_device = torch.device(donor_device)
+    enabled = (
+        donor_device != compute_device
+        and _is_hip_software_gemm_device(compute_device)
+        and _is_hip_software_gemm_device(donor_device)
+        and execution_mode in _HIP_DONOR_GEMM_EXECUTION_MODES
+        and _is_eligible_donor_gemm(module, execution_mode)
+    )
+
+    if not enabled:
+        if original_forward is not None:
+            module.forward = original_forward
+            del module._mgpu_original_forward
+            del module._mgpu_donor_execution_device
+        return False
+
+    if original_forward is None:
+        original_forward = module.forward
+        module._mgpu_original_forward = original_forward
+        module._mgpu_donor_gemm_calls = 0
+
+        def donor_forward(*args, **kwargs):
+            target_device = module._mgpu_donor_execution_device
+            execution_mode = module._mgpu_donor_execution_mode
+            if (
+                execution_mode == "mixed"
+                and _is_large_donor_gemm(module)
+                and _can_tile_linear_on_compute(module)
+                and len(args) == 1
+                and isinstance(args[0], torch.Tensor)
+                and not kwargs
+            ):
+                output = _run_tiled_linear_on_compute(
+                    args[0], module, module._mgpu_compute_device
+                )
+                module._mgpu_donor_gemm_calls += 1
+                if module._mgpu_donor_gemm_calls == 1:
+                    logger.info(
+                        "[MultiGPU DisTorch V2] Tiled donor GEMM active: %s -> %s (%s)",
+                        target_device,
+                        module._mgpu_compute_device,
+                        type(module).__name__,
+                    )
+                return output
+
+            donor_args = _move_tensors(args, target_device)
+            donor_kwargs = _move_tensors(kwargs, target_device)
+            output = module._mgpu_original_forward(*donor_args, **donor_kwargs)
+            output = _move_tensors(output, module._mgpu_compute_device)
+            module._mgpu_donor_gemm_calls += 1
+            if module._mgpu_donor_gemm_calls == 1:
+                logger.info(
+                    "[MultiGPU DisTorch V2] Donor GEMM active: %s -> %s (%s)",
+                    module._mgpu_compute_device,
+                    target_device,
+                    type(module).__name__,
+                )
+            return output
+
+        module.forward = donor_forward
+
+    module._mgpu_compute_device = compute_device
+    module._mgpu_donor_execution_device = donor_device
+    module._mgpu_donor_execution_mode = execution_mode
+    return True
+
+
+def pin_hip_offloaded_weight(module):
+    """Convert a CPU module weight into the HIP backend's mapped-host format."""
+    if not getattr(torch.version, "hip", None):
+        return False
+
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
+        return False
+    if weight.is_pinned():
+        return True
+
+    try:
+        from comfy_kitchen.backends import hip
+    except ImportError:
+        return False
+
+    offload_weight = getattr(hip, "offload_weight", None)
+    if not callable(offload_weight):
+        return False
+
+    pinned_weight = offload_weight(weight)
+    if isinstance(weight, torch.nn.Parameter):
+        pinned_weight = torch.nn.Parameter(
+            pinned_weight, requires_grad=weight.requires_grad
+        )
+    module.weight = pinned_weight
+    return True
 
 
 def register_patched_safetensor_modelpatcher():
@@ -296,6 +493,9 @@ def register_patched_safetensor_modelpatcher():
                 return result
 
             allocations = inner_model._distorch_v2_meta["full_allocation"]
+            donor_gemm_execution_mode = inner_model._distorch_v2_meta.get(
+                "donor_gemm_execution_mode", "mixed"
+            )
 
             if not hasattr(self.model, "_distorch_high_precision_loras"):
                 self.model._distorch_high_precision_loras = True
@@ -325,11 +525,15 @@ def register_patched_safetensor_modelpatcher():
                 hasattr(self, "_distorch_last_allocations")
                 and self._distorch_last_allocations == allocations
             )
+            compute_device_matches = hasattr(
+                self, "_distorch_last_compute_device"
+            ) and self._distorch_last_compute_device == str(torch.device(device_to))
             cache_exists = hasattr(self, "_distorch_cached_assignments")
 
             if (
                 cache_exists
                 and allocations_match
+                and compute_device_matches
                 and not unpatch_weights
                 and not force_patch_weights
             ):
@@ -339,10 +543,14 @@ def register_patched_safetensor_modelpatcher():
                 )
             else:
                 device_assignments = analyze_safetensor_loading(
-                    self, allocations, is_clip=is_clip_model
+                    self,
+                    allocations,
+                    is_clip=is_clip_model,
+                    compute_device=device_to,
                 )  ## This should be the only required line - that is how it worked previous release so if it doesn't it is Comfy changes
                 self._distorch_cached_assignments = device_assignments
                 self._distorch_last_allocations = allocations
+                self._distorch_last_compute_device = str(torch.device(device_to))
 
             model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
             high_precision_loras = getattr(
@@ -381,34 +589,45 @@ def register_patched_safetensor_modelpatcher():
                         )
                         module_object.to(block_target_device)
 
+                    configure_hip_donor_gemm_offload(
+                        module_object,
+                        device_to,
+                        block_target_device,
+                        donor_gemm_execution_mode,
+                    )
+
                     mem_counter += module_size
                     continue
 
-                # Step 1: Write block/tensor to compute device first
-                module_object.to(device_to)
+                block_target_device = device_assignments["block_assignments"].get(
+                    module_name, device_to
+                )
 
-                # Step 2: Apply LoRa patches while on compute device
+                # Move directly to the assigned device. Staging donor weights on the
+                # compute GPU defeats offload and can OOM before the forward wrapper.
+                module_object.to(block_target_device)
+
+                # Step 2: Apply LoRa patches on the assigned device.
                 weight_key = f"{module_name}.weight"
                 bias_key = f"{module_name}.bias"
 
                 if weight_key in self.patches:
-                    self.patch_weight_to_device(weight_key, device_to=device_to)
+                    self.patch_weight_to_device(
+                        weight_key, device_to=block_target_device
+                    )
                 if weight_key in self.weight_wrapper_patches:
                     module_object.weight_function.extend(
                         self.weight_wrapper_patches[weight_key]
                     )
 
                 if bias_key in self.patches:
-                    self.patch_weight_to_device(bias_key, device_to=device_to)
+                    self.patch_weight_to_device(bias_key, device_to=block_target_device)
                 if bias_key in self.weight_wrapper_patches:
                     module_object.bias_function.extend(
                         self.weight_wrapper_patches[bias_key]
                     )
 
                 # Step 3: FP8 casting for CPU storage (if enabled)
-                block_target_device = device_assignments["block_assignments"].get(
-                    module_name, device_to
-                )
                 has_patches = weight_key in self.patches or bias_key in self.patches
 
                 if (
@@ -431,13 +650,25 @@ def register_patched_safetensor_modelpatcher():
                                 f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage"
                             )
 
-                # Step 4: Move to ultimate destination based on DisTorch assignment
+                # Step 4: Enable runtime weight casting for offloaded modules.
                 if str(block_target_device) != str(device_to):
-                    logger.debug(
-                        f"[MultiGPU DisTorch V2] Moving {module_name} from {device_to} to {block_target_device}"
-                    )
-                    module_object.to(block_target_device)
+                    if block_target_device == "cpu" and pin_hip_offloaded_weight(
+                        module_object
+                    ):
+                        logger.debug(
+                            f"[MultiGPU DisTorch V2] Pinned {module_name} weight for direct HIP host access"
+                        )
                     module_object.comfy_cast_weights = True
+
+                if configure_hip_donor_gemm_offload(
+                    module_object,
+                    device_to,
+                    block_target_device,
+                    donor_gemm_execution_mode,
+                ):
+                    logger.debug(
+                        f"[MultiGPU DisTorch V2] Running {module_name} GEMM on donor {block_target_device}"
+                    )
 
                 # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
@@ -485,7 +716,9 @@ def _extract_clip_head_blocks(raw_block_list, compute_device):
     return head_blocks, distributable_blocks, block_assignments, head_memory
 
 
-def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False):
+def analyze_safetensor_loading(
+    model_patcher, allocations_string, is_clip=False, compute_device=None
+):
     """
     Analyze and distribute safetensor model blocks across devices.
     Supports CLIP head preservation when is_clip=True.
@@ -499,10 +732,37 @@ def analyze_safetensor_loading(model_patcher, allocations_string, is_clip=False)
     else:
         distorch_alloc = allocations_string
 
-    compute_device = virtual_vram_str.split(";")[0] if virtual_vram_str else "cuda:0"
+    distorch_alloc = distorch_alloc.strip()
+    if distorch_alloc and not any(
+        "," in allocation for allocation in distorch_alloc.split(";")
+    ):
+        logger.warning(
+            "[MultiGPU DisTorch V2] Ignoring invalid expert allocation %r; "
+            "using virtual-VRAM allocation instead.",
+            distorch_alloc,
+        )
+        distorch_alloc = ""
+
+    metadata_compute_device = (
+        virtual_vram_str.split(";")[0] if virtual_vram_str else "cuda:0"
+    )
+    if compute_device is None:
+        compute_device = metadata_compute_device
+    else:
+        compute_device = str(torch.device(compute_device))
+        if compute_device != metadata_compute_device:
+            logger.warning(
+                "[MultiGPU DisTorch V2] Allocation metadata names %s as the compute "
+                "device, but inference is running on %s; using the runtime device.",
+                metadata_compute_device,
+                compute_device,
+            )
     logger.debug(f"[MultiGPU DisTorch V2] Compute Device: {compute_device}")
 
     if not distorch_alloc:
+        if virtual_vram_str:
+            virtual_vram_parts = virtual_vram_str.split(";", 1)
+            virtual_vram_str = ";".join([compute_device, *virtual_vram_parts[1:]])
         distorch_alloc = calculate_safetensor_vvram_allocation(
             model_patcher, virtual_vram_str
         )

@@ -36,6 +36,21 @@ What is DisTorch? Standing for "distributed torch", the DisTorch nodes in this c
       - **Example**: `cuda:0,0.1;cpu,0.5` will use 10% of `cuda:0`'s VRAM and 50% of the `cpu`'s RAM to hold the model.
       - **Example**: `cuda:0,0.0207;cuda:1,0.1273;cpu,0.0808` will use 2.1% of `cuda:0`'s VRAM, 12.7% of `cuda:1`'s VRAM, and 8.1% of the `cpu`'s RAM to hold the model.
 
+### AMD ROCm Software-GEMM Donors
+
+With a Comfy Kitchen build that includes HIP software-tiled GEMM support, DisTorch can execute eligible donor-assigned linear layers on a second AMD GPU instead of copying their weights back to the compute GPU for every operation. The layer input is sent to the donor, its GEMM runs there, and the result returns to the compute GPU.
+
+This is enabled automatically only when both the compute and donor GPUs use the HIP software-GEMM path: Vega/GCN5 (`gfx900`, `gfx906`, `gfx90c`), RDNA1 (`gfx1010`-`gfx1012`), or RDNA2 (`gfx1030`-`gfx1036`). Native-WMMA GPUs retain the normal placement behavior.
+
+For VRAM-constrained systems, use Expert Mode to place a meaningful group of model layers on the donor, for example `cuda:0,2gb;cuda:1,4gb;cpu,*`. This keeps those weights and their temporary GEMM intermediates off `cuda:0`, which can make room for larger latents, longer video contexts, or a model that otherwise would not fit on the primary GPU. CPU-assigned HIP weights are also pinned so the HIP backend can use its mapped-host weight path.
+
+Donor execution trades transfer bandwidth and latency for lower peak VRAM on the compute GPU. DisTorch2 nodes provide a `donor_gemm_execution_mode` selector:
+
+- **mixed** (default): lightweight donor-assigned linear GEMMs execute on the donor. For larger standard linear layers, DisTorch streams output-channel weight tiles to the compute GPU and runs each tile there, limiting the compute GPU's temporary weight allocation while keeping both GPUs busy.
+- **all**: every eligible donor-resident linear GEMM executes entirely on the donor. Use this when the donor can complete even large GEMMs quickly enough that avoiding transfers is preferable.
+
+Both modes require compute and donor GPUs that use the HIP software-GEMM path. Look for `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1` in the ComfyUI log to confirm that the donor path was invoked.
+
 ## 🎯 Key Benefits
 
 - Free up GPU VRAM instantly without complex settings
