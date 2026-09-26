@@ -1,10 +1,4 @@
-# ComfyUI-MultiGPU v2: Universal .safetensors and GGUF Multi-GPU Distribution with DisTorch
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/pollockjj/ComfyUI-MultiGPU/main/assets/distorch_average.png" width="600">
-  <br>
-  <em>Free almost all of your GPU for what matters: Maximum latent space processing</em>
-</p>
+# ComfyUI-MultiGPU v2: Universal .safetensors and GGUF Multi-GPU Distribution with DisTorch - Now with ROCm Enhancments
 
 ## The Core of ComfyUI-MultiGPU v2
 
@@ -12,14 +6,6 @@
 2. **Up to 10% Faster GGUF Inference versus DisTorch1**: The new DisTorch2 logic provides potential speedups for GGUF models versus the DisTorch V1 method.
 3. **Bespoke WanVideoWrapper Integration**: Tightly integrated, stable support for WanVideoWrapper with eight bespoke MultiGPU nodes.
 4. **New Model-Driven Allocation Options**: Two new inutuitive model-driven Expert Modes to facilitate exact placement on all available devices - 'bytes' and 'ratio'
-
-<h1 align="center">DisTorch: How It Works</h1>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/pollockjj/ComfyUI-MultiGPU/main/assets/distorch2_0.gif" width="800">
-  <br>
-  <em>DisTorch 2.0 in Action</em>
-</p>
 
 What is DisTorch? Standing for "distributed torch", the DisTorch nodes in this custom_node provide a way of moving the static parts of your main image generation model known as the `UNet` off your main compute card to somewhere slower, but one that is not taking up space that could be better used for longer videos or more concurrent images. By selecting one or more donor devices - main CPU DRAM or another cuda/xps device's VRAM - you can select how much of the model is loaded on that device instead of your main `compute` card. Just set how much VRAM you want to free up, and DisTorch handles the rest.
 
@@ -36,9 +22,9 @@ What is DisTorch? Standing for "distributed torch", the DisTorch nodes in this c
       - **Example**: `cuda:0,0.1;cpu,0.5` will use 10% of `cuda:0`'s VRAM and 50% of the `cpu`'s RAM to hold the model.
       - **Example**: `cuda:0,0.0207;cuda:1,0.1273;cpu,0.0808` will use 2.1% of `cuda:0`'s VRAM, 12.7% of `cuda:1`'s VRAM, and 8.1% of the `cpu`'s RAM to hold the model.
 
-### AMD ROCm Software-GEMM Donors
+### AMD ROCm Software-GEMM MultiGPU Enhancements
 
-With a Comfy Kitchen build that includes HIP software-tiled GEMM support, DisTorch can execute eligible donor-assigned linear layers on a second AMD GPU instead of copying their weights back to the compute GPU for every operation. The layer input is sent to the donor, its GEMM runs there, and the result returns to the compute GPU.
+With a Comfy Kitchen build that includes HIP software-tiled GEMM support found here: [https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup), DisTorch can execute eligible donor-assigned linear layers on a second AMD GPU instead of copying their weights back to the compute GPU for every operation. The layer input is sent to the donor, its GEMM runs there, and the result returns to the compute GPU.
 
 This is enabled automatically only when both the compute and donor GPUs use the HIP software-GEMM path: Vega/GCN5 (`gfx900`, `gfx906`, `gfx90c`), RDNA1 (`gfx1010`-`gfx1012`), or RDNA2 (`gfx1030`-`gfx1036`). Native-WMMA GPUs (RDNA 3 and later / CDNA) retain the normal placement behavior.
 
@@ -46,8 +32,8 @@ For VRAM-constrained systems, use Expert Mode to place a meaningful group of mod
 
 Donor execution trades transfer bandwidth and latency for lower peak VRAM on the compute GPU. DisTorch2 nodes provide a `donor_gemm_execution_mode` selector:
 
-- **mixed**: the donor GPU runs the diffusion model. Activations, norms, modulation, rope, residuals, dequantization and weight patches stay on the donor. Linear layers and attention send their GEMM work to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied straight back into a buffer on the donor. The compute GPU never holds a full activation, so high-resolution images and long videos are limited by donor memory (for example an APU/iGPU using shared system RAM) rather than compute-GPU VRAM. The first GPU donor in the allocation is used; weights assigned to the compute GPU still stay there, so a larger `virtual_vram_gb` leaves more room for GEMM tiles. Conv2d and Conv3d layers are handled the same way: the donor keeps the activation and sends the compute GPU only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). With `VAELoaderDisTorch2MultiGPU`, mixed mode runs image and video VAE encode and decode on the donor, including temporal caches such as Wan's, and their conv and linear GEMMs run on the compute GPU. VAE mixed mode does not require Comfy Kitchen attention, because VAE attention stays on the donor. Grouped convs still run on the donor.
-- **all**: every eligible donor-resident linear GEMM executes entirely on the donor. Use this when the donor can complete even large GEMMs quickly enough that avoiding transfers is preferable.
+- **mixed** (specifically for AMD+AMD laptops/systems, tested on a Dell G5 15 SE that has an RX5600M 6gb, and a Ryzen Vega APU): the donor GPU runs the diffusion model. Activations, norms, modulation, rope, residuals, dequantization and weight patches stay on the donor. Linear layers and attention send their GEMM work to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied straight back into a buffer on the donor. The compute GPU never holds a full activation, so high-resolution images and long videos are limited by donor memory (for example an APU/iGPU using shared system RAM) rather than compute-GPU VRAM. The first GPU donor in the allocation is used; weights assigned to the compute GPU still stay there, so a larger `virtual_vram_gb` leaves more room for GEMM tiles. Conv2d and Conv3d layers are handled the same way: the donor keeps the activation and sends the compute GPU only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). With `VAELoaderDisTorch2MultiGPU`, mixed mode runs image and video VAE encode and decode on the donor, including temporal caches such as Wan's, and their conv and linear GEMMs run on the compute GPU. VAE mixed mode does not require Comfy Kitchen attention, because VAE attention stays on the donor. Grouped convs still run on the donor.
+- **all**: every eligible donor-resident linear GEMM executes entirely on the donor. Use this when the donor can complete even large GEMMs quickly enough that avoiding transfers is preferable. (Basically a crude version of SLI/Crossfire for the AI model inferencing, should work well with a 50/50 split on identical or similar GPUs like 2x 5700XTs or 2x Radeon VIIs)
 
 Both modes require compute and donor GPUs that use the HIP software-GEMM path. Look for `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1` in the ComfyUI log to confirm that the donor path was invoked.
 
@@ -59,12 +45,6 @@ Both modes require compute and donor GPUs that use the HIP software-GEMM path. L
 - Seamlessly distribute .safetensors and GGUF layers across multiple GPUs if available
 - Allows **you** to easily shift from ***on-device speed*** to ***open-device latent space capability*** with a simple one-number change
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/pollockjj/ComfyUI-MultiGPU/main/assets/distorch_node.png" width="400">
-  <br>
-  <em>DisTorch Nodes with one simple number to tune its Vitual VRAM to your needs</em>
-</p>
-
 ## 🚀 Compatibility
 
 Works with all .safetensors and GGUF-quantized models.
@@ -72,12 +52,6 @@ Works with all .safetensors and GGUF-quantized models.
 On current ComfyUI builds with DynamicVRAM/comfy-aimdo enabled, MultiGPU keeps DynamicVRAM active on CUDA devices that comfy-aimdo has initialized and falls back to legacy model patching for off-grid MultiGPU CUDA devices. This preserves MultiGPU placement for devices such as `cuda:1` even when comfy-aimdo only initialized the primary device.
 
 ⚙️ Expert users: Like .gguf or exl2/3 LLM loaders, use the expert_mode_alloaction for exact allocations of model shards on as many devices as your setup has!
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/pollockjj/ComfyUI-MultiGPU/main/assets/distorch2_0.png" width="300">
-  <br>
-  <em>The new Virtual VRAM even lets you offload ALL of the model and still run compute on your CUDA device!</em>
-</p>
 
 ## Installation
 
