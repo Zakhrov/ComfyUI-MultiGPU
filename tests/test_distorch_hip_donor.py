@@ -340,13 +340,85 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             self.distorch.mm, "get_free_memory", lambda *_: 700
         ):
             output = self.distorch._run_attention_on_compute(
-                attention, q, k, v, 2, compute_device=torch.device("cpu"), skip_reshape=True
+                attention, q, k, v, 2, compute_device=torch.device("cpu"), plan={}, skip_reshape=True
             )
 
         self.assertGreater(len(calls), 1)
         self.assertTrue(
             torch.allclose(output, attention(q, k, v, 2, skip_reshape=True), atol=1e-6)
         )
+
+    def test_attention_chunks_heads_with_grouped_kv(self):
+        q = torch.randn(1, 5, 4 * 3)
+        k, v = (torch.randn(1, 7, 2 * 3) for _ in range(2))
+        head_counts = []
+
+        def attention(q, k, v, heads, mask=None, skip_output_reshape=False, **kwargs):
+            head_counts.append(heads)
+            q, k, v = (t.unflatten(-1, (-1, 3)).transpose(1, 2) for t in (q, k, v))
+            out = functional.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            if skip_output_reshape:
+                return out
+            return out.transpose(1, 2).flatten(2)
+
+        for skip_output_reshape in (False, True):
+            with mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0), mock.patch.object(
+                self.distorch.mm, "get_free_memory", lambda *_: 2 * 7 * 3 * 4 * 2
+            ):
+                output = self.distorch._run_attention_on_compute(
+                    attention, q, k, v, 4, compute_device=torch.device("cpu"), plan={},
+                    skip_output_reshape=skip_output_reshape,
+                )
+            expected = attention(q, k, v, 4, skip_output_reshape=skip_output_reshape)
+            self.assertTrue(torch.allclose(output, expected, atol=1e-6))
+        self.assertIn(2, head_counts)
+
+    def test_attention_shrinks_chunks_after_oom(self):
+        q, k, v = (torch.randn(1, 4, 8, 3) for _ in range(3))
+        plan = {}
+
+        def attention(q, k, v, heads, mask=None, **kwargs):
+            if q.shape[1] * q.shape[2] > 4:
+                raise torch.OutOfMemoryError("out of memory")
+            return functional.scaled_dot_product_attention(q, k, v)
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30):
+            output = self.distorch._run_attention_on_compute(
+                attention, q, k, v, 4, compute_device=torch.device("cpu"), plan=plan,
+                skip_reshape=True, skip_output_reshape=True,
+            )
+
+        self.assertTrue(
+            torch.allclose(output, functional.scaled_dot_product_attention(q, k, v), atol=1e-6)
+        )
+        chunk_heads, chunk_tokens, budget = plan[(q.shape, k.shape)]
+        self.assertLessEqual(chunk_heads * chunk_tokens, 4)
+        self.assertIsNone(budget)
+
+    def test_attention_falls_back_to_donor_when_nothing_fits(self):
+        q, k, v = (torch.randn(1, 2, 4, 3) for _ in range(3))
+        plan = {}
+        donor_calls = []
+
+        def attention(q_in, k_in, v_in, heads, mask=None, **kwargs):
+            # Chunks are views, so only the donor fallback sees the original tensors.
+            if q_in is not q:
+                raise torch.OutOfMemoryError("out of memory")
+            donor_calls.append(q_in.shape)
+            return functional.scaled_dot_product_attention(q_in, k_in, v_in)
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30):
+            for _ in range(2):
+                output = self.distorch._run_attention_on_compute(
+                    attention, q, k, v, 2, compute_device=torch.device("cpu"), plan=plan,
+                    skip_reshape=True, skip_output_reshape=True,
+                )
+
+        self.assertTrue(
+            torch.allclose(output, functional.scaled_dot_product_attention(q, k, v), atol=1e-6)
+        )
+        self.assertIsNone(plan[(q.shape, k.shape)])
+        self.assertEqual(donor_calls[-2:], [q.shape, q.shape])
 
     def test_mixed_execution_moves_model_to_donor_and_routes_attention(self):
         calls = []
@@ -410,6 +482,41 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertEqual(calls[0]["device"], "cpu")
         self.assertTrue(calls[0]["offloadable"])
         self.assertEqual(calls[1], "uncast")
+
+    def test_mixed_mode_keeps_castable_weights_in_system_ram(self):
+        donor = torch.device("cuda:1")
+        self.assertEqual(
+            self.distorch._mixed_weight_device(AllocationModule(), donor), "cpu"
+        )
+        self.assertEqual(
+            self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), donor), donor
+        )
+
+    def test_pinning_keeps_quantized_weight_metadata(self):
+        class PackedTensor(torch.Tensor):
+            pass
+
+        module = torch.nn.Linear(1, 1, bias=False)
+        weight = torch.randint(0, 255, (4, 144), dtype=torch.uint8).as_subclass(PackedTensor)
+        module.weight = torch.nn.Parameter(weight, requires_grad=False)
+        module.weight.tensor_type = "Q4_K"
+        hip = types.ModuleType("comfy_kitchen.backends.hip")
+        hip.offload_weight = lambda value: value.clone()
+        backends = types.ModuleType("comfy_kitchen.backends")
+        backends.hip = hip
+
+        with (
+            mock.patch.object(torch.version, "hip", "6.4"),
+            mock.patch.dict(
+                sys.modules,
+                {"comfy_kitchen.backends": backends, "comfy_kitchen.backends.hip": hip},
+            ),
+        ):
+            self.assertTrue(self.distorch.pin_hip_offloaded_weight(module))
+
+        self.assertIsInstance(module.weight, PackedTensor)
+        self.assertEqual(module.weight.tensor_type, "Q4_K")
+        self.assertTrue(torch.equal(module.weight, weight))
 
     def test_mixed_mode_requires_standard_linear_tiling(self):
         self.assertFalse(self.distorch.configure_mixed_gemm(DonorModule(), "cuda:0", "cuda:1"))

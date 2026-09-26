@@ -36,15 +36,12 @@ _HIP_SOFTWARE_GEMM_ARCHITECTURES = frozenset(
 )
 # Headroom left free on the compute GPU for GEMM workspaces PyTorch cannot see.
 _COMPUTE_GPU_RESERVE_BYTES = 512 * 1024 * 1024
-# Attention sizes chunks from its measured peak, which includes the backend's
-# workspace, so it needs less headroom.
+# Attention shrinks its chunks when it runs out of memory, so it needs less headroom.
 _ATTENTION_RESERVE_BYTES = 128 * 1024 * 1024
 # Conv tiles stop getting faster well below this, and larger ones let the
 # backend's im2col workspace exhaust the compute GPU. A fixed cap also keeps
 # tile shapes stable so MIOpen reuses its tuned kernels between runs.
 _CONV_TILE_BUDGET_BYTES = 128 * 1024 * 1024
-# Below this many queries per chunk, per-call overhead makes the donor faster.
-_MIN_ATTENTION_CHUNK_TOKENS = 256
 
 
 def unpack_load_item(item):
@@ -320,81 +317,106 @@ def _run_tiled_conv_on_compute(
     return output
 
 
-def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, mask=None, **kwargs):
-    """Run attention on the compute GPU in query chunks; K and V are copied once.
+def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan, mask=None, **kwargs):
+    """Run attention on the compute GPU in head and query chunks.
 
-    Chunks are sized from the measured memory of earlier chunks: a 1-token
-    probe gives the backend's fixed per-call cost, and a second chunk gives
-    the per-token cost. Queries that cannot be chunked efficiently in the
-    remaining VRAM run on the donor instead.
+    Heads are independent, so a chunk only copies its own heads' K and V. The
+    first chunk size assumes the backend materializes scores; query chunks
+    then grow while PyTorch's measured peak stays under half the budget, and
+    halve on OOM because backend workspaces are invisible to that measure.
+    The learned size is kept in plan for the forward's other layers. When one
+    head group and one query still do not fit, attention runs on the donor.
     """
-    kv_bytes = (k.numel() + v.numel()) * k.element_size()
-    budget = _compute_budget(compute_device, _ATTENTION_RESERVE_BYTES) - kv_bytes
-    if mask is not None or budget <= 0:
+    key = (q.shape, k.shape)
+    if mask is not None or plan.get(key, True) is None:
         return func(q, k, v, heads, *args, mask=mask, **kwargs)
 
-    seq_dim = 2 if kwargs.get("skip_reshape", False) else 1
-    out_dim = 2 if kwargs.get("skip_output_reshape", False) else 1
+    skip_reshape = kwargs.get("skip_reshape", False)
+    skip_output_reshape = kwargs.get("skip_output_reshape", False)
+    seq_dim = 2 if skip_reshape else 1
+    out_seq_dim = 2 if skip_output_reshape else 1
     tokens = q.shape[seq_dim]
-    q_token_bytes = q.numel() // tokens * q.element_size()
-    # Used for the second chunk only: assumes the backend materializes scores,
-    # softmax and one temporary per query.
-    conservative_token_bytes = (
-        2 * q_token_bytes + 3 * q.shape[0] * heads * k.shape[seq_dim] * q.element_size()
-    )
-    measure_peak = compute_device.type == "cuda"
-    donor_k, donor_v = k, v
-    k = k.to(device=compute_device)
-    v = v.to(device=compute_device)
-    output = None
-    probes = []
-    use_donor = False
-    tokens_per_chunk = 1 if measure_peak else max(1, budget // conservative_token_bytes)
-    start = 0
-    while start < tokens:
-        length = min(tokens_per_chunk, tokens - start)
-        q_chunk = q.narrow(seq_dim, start, length)
-        on_compute = not use_donor
-        if on_compute:
-            q_chunk = q_chunk.to(device=compute_device)
-            if measure_peak:
-                torch.cuda.reset_peak_memory_stats(compute_device)
-                base = torch.cuda.memory_allocated(compute_device)
-            with torch.cuda.device_of(q_chunk):
-                out_chunk = func(q_chunk, k, v, heads, *args, mask=None, **kwargs)
-        else:
-            # Too little compute VRAM to amortize the per-call cost: finish on the donor.
-            del k, v
-            length = tokens - start
-            q_chunk = q.narrow(seq_dim, start, length)
-            with torch.cuda.device_of(q_chunk):
-                out_chunk = func(q_chunk, donor_k, donor_v, heads, *args, mask=None, **kwargs)
-        if output is None:
-            shape = list(out_chunk.shape)
-            shape[out_dim] = tokens
-            output = torch.empty(shape, device=q.device, dtype=out_chunk.dtype)
-        output.narrow(out_dim, start, length).copy_(out_chunk)
-        del q_chunk, out_chunk
-        start += length
-        if not (measure_peak and on_compute):
-            continue
-        used = torch.cuda.max_memory_allocated(compute_device) - base + length * q_token_bytes
-        # Re-read free memory each chunk so allocations outside PyTorch, such
-        # as a resident text encoder, shrink the next chunk.
+    head_dim = q.shape[-1] if skip_reshape else q.shape[-1] // heads
+    kv_heads = k.shape[1] if skip_reshape else k.shape[-1] // head_dim
+    group = heads // kv_heads
+
+    def head_slice(tensor, start, count, total, heads_last):
+        if not heads_last:
+            return tensor.narrow(1, start, count)
+        width = tensor.shape[-1] // total
+        return tensor.narrow(-1, start * width, count * width)
+
+    chunk = plan.get(key)
+    if chunk is None:
         budget = _compute_budget(compute_device, _ATTENTION_RESERVE_BYTES)
-        probes.append((length, used))
-        if len(probes) == 1:
-            tokens_per_chunk = max(2, (budget - used) // conservative_token_bytes)
-        elif length > probes[0][0]:
-            token_bytes = max(
-                q_token_bytes, (used - probes[0][1]) // (length - probes[0][0])
-            )
-            fixed_bytes = max(0, probes[0][1] - probes[0][0] * token_bytes)
-            fit = (budget - fixed_bytes) // token_bytes
-            use_donor = fit < _MIN_ATTENTION_CHUNK_TOKENS
-            # Small probes hide the per-token cost in allocator rounding, so grow
-            # at most 4x per chunk and re-measure before trusting the estimate.
-            tokens_per_chunk = max(1, min(fit, 4 * length))
+        element_size = q.element_size()
+        batch = q.shape[0]
+        group_kv_bytes = (k.numel() + v.numel()) // kv_heads * element_size
+        head_token_bytes = 3 * batch * (head_dim + k.shape[seq_dim]) * element_size
+        groups = max(1, min(kv_heads, budget // 2 // group_kv_bytes))
+        chunk_tokens = (budget - groups * group_kv_bytes) // (groups * group * head_token_bytes)
+        # [heads per chunk, queries per chunk, budget; None once an OOM stops growth]
+        chunk = plan[key] = [groups * group, min(tokens, max(1, chunk_tokens)), budget]
+
+    measure_peak = torch.device(compute_device).type == "cuda"
+    output = None
+    head = 0
+    while head < heads:
+        count = min(chunk[0], heads - head)
+        k_chunk = head_slice(k, head // group, count // group, kv_heads, not skip_reshape).to(device=compute_device)
+        v_chunk = head_slice(v, head // group, count // group, kv_heads, not skip_reshape).to(device=compute_device)
+        start = 0
+        while start < tokens:
+            length = min(chunk[1], tokens - start)
+            q_chunk = head_slice(q, head, count, heads, not skip_reshape).narrow(seq_dim, start, length)
+            out_chunk = None
+            try:
+                q_chunk = q_chunk.to(device=compute_device)
+                if measure_peak:
+                    torch.cuda.reset_peak_memory_stats(compute_device)
+                    base = torch.cuda.memory_allocated(compute_device)
+                with torch.cuda.device_of(q_chunk):
+                    out_chunk = func(q_chunk, k_chunk, v_chunk, count, *args, mask=None, **kwargs)
+            except torch.OutOfMemoryError:
+                # Recover outside the except block, once the failed call's tensors are freed.
+                pass
+            if out_chunk is None:
+                del q_chunk
+                torch.cuda.empty_cache()
+                chunk[2] = None
+                if chunk[1] > 1:
+                    chunk[1] = max(1, chunk[1] // 2)
+                    continue
+                if chunk[0] > group:
+                    chunk[0] = max(group, chunk[0] // 2 // group * group)
+                    break
+                del k_chunk, v_chunk
+                plan[key] = None
+                logger.info(
+                    "[MultiGPU DisTorch V2] Attention does not fit on %s; running it on the donor",
+                    compute_device,
+                )
+                return func(q, k, v, heads, *args, mask=None, **kwargs)
+            if output is None:
+                shape = list(out_chunk.shape)
+                shape[out_seq_dim] = tokens
+                head_axis = 1 if skip_output_reshape else -1
+                shape[head_axis] = shape[head_axis] // count * heads
+                output = torch.empty(shape, device=q.device, dtype=out_chunk.dtype)
+            head_slice(output, head, count, heads, not skip_output_reshape).narrow(
+                out_seq_dim, start, length
+            ).copy_(out_chunk)
+            del q_chunk, out_chunk
+            start += length
+            if (
+                measure_peak
+                and chunk[2] is not None
+                and 2 * (torch.cuda.max_memory_allocated(compute_device) - base) < chunk[2]
+            ):
+                chunk[1] = min(tokens, 2 * chunk[1])
+        else:
+            head += count
+        del k_chunk, v_chunk
     return output
 
 
@@ -584,6 +606,16 @@ def _first_tensor(value):
     return None
 
 
+def _mixed_weight_device(module, donor_device):
+    """Where mixed mode stores a module's weights.
+
+    Castable weights stay in system RAM and are prepared one layer at a time on
+    the donor, which leaves donor memory for activations and the compute GPU
+    for GEMM tiles. Modules that cannot be cast at runtime live on the donor.
+    """
+    return "cpu" if hasattr(module, "comfy_cast_weights") else donor_device
+
+
 def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=False):
     """Pick the donor GPU that holds a mixed-mode model's activations, or None."""
     compute_device = torch.device(compute_device)
@@ -625,12 +657,17 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device):
             output_device = _first_tensor(args).device
             transformer_options = transformer_options.copy()
             previous_override = transformer_options.get("optimized_attention_override")
+            attention_plan = {}
 
             def attention_on_compute(func, *attention_args, **attention_kwargs):
                 if previous_override is not None:
                     func = functools.partial(previous_override, func)
                 return _run_attention_on_compute(
-                    func, *attention_args, compute_device=compute, **attention_kwargs
+                    func,
+                    *attention_args,
+                    compute_device=compute,
+                    plan=attention_plan,
+                    **attention_kwargs,
                 )
 
             transformer_options["optimized_attention_override"] = attention_on_compute
@@ -770,12 +807,9 @@ def pin_hip_offloaded_weight(module):
     if not callable(offload_weight):
         return False
 
-    pinned_weight = offload_weight(weight)
-    if isinstance(weight, torch.nn.Parameter):
-        pinned_weight = torch.nn.Parameter(
-            pinned_weight, requires_grad=weight.requires_grad
-        )
-    module.weight = pinned_weight
+    # Swap only the storage: replacing the weight drops tensor-subclass metadata
+    # such as a GGUF weight's quant type and logical shape.
+    weight.data = offload_weight(weight.data)
     return True
 
 
@@ -1131,6 +1165,11 @@ def register_patched_safetensor_modelpatcher():
             # Mixed mode keeps activations on the donor, so weights stored anywhere
             # else are cast to it at runtime.
             activation_device = mixed_donor_device or device_to
+            if mixed_donor_device is not None:
+                logger.info(
+                    "[MultiGPU DisTorch V2] Mixed mode: weights stay in system RAM; %s holds activations",
+                    mixed_donor_device,
+                )
 
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
@@ -1145,6 +1184,10 @@ def register_patched_safetensor_modelpatcher():
                     block_target_device = device_assignments["block_assignments"].get(
                         module_name, device_to
                     )
+                    if mixed_donor_device is not None:
+                        block_target_device = _mixed_weight_device(
+                            module_object, mixed_donor_device
+                        )
                     current_module_device = None
                     try:
                         if any(
@@ -1183,6 +1226,10 @@ def register_patched_safetensor_modelpatcher():
                 block_target_device = device_assignments["block_assignments"].get(
                     module_name, device_to
                 )
+                if mixed_donor_device is not None:
+                    block_target_device = _mixed_weight_device(
+                        module_object, mixed_donor_device
+                    )
 
                 # Move directly to the assigned device. Staging donor weights on the
                 # compute GPU defeats offload and can OOM before the forward wrapper.
