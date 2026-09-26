@@ -44,10 +44,10 @@ def _create_distorch_safetensor_v2_override(
             )
             inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
             inputs["optional"]["donor_gemm_execution_mode"] = (
-                ["mixed", "all"],
+                ["disabled", "mixed", "all"],
                 {
-                    "default": "mixed",
-                    "tooltip": "mixed runs lightweight GEMMs on the donor and streams large linear GEMM tiles to the compute GPU; all runs every GEMM on the donor.",
+                    "default": "disabled",
+                    "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; all runs every eligible GEMM on the donor.",
                 },
             )
             inputs["optional"]["expert_mode_allocations"] = (
@@ -70,7 +70,7 @@ def _create_distorch_safetensor_v2_override(
             *args,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="mixed",
+            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
@@ -94,7 +94,7 @@ def _create_distorch_safetensor_v2_override(
             *args,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="mixed",
+            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
@@ -374,10 +374,10 @@ def override_class_with_distorch_gguf_v2(cls):
             )
             inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
             inputs["optional"]["donor_gemm_execution_mode"] = (
-                ["mixed", "all"],
+                ["disabled", "mixed", "all"],
                 {
-                    "default": "mixed",
-                    "tooltip": "mixed runs lightweight GEMMs on the donor and streams large linear GEMM tiles to the compute GPU; all runs every GEMM on the donor.",
+                    "default": "disabled",
+                    "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; all runs every eligible GEMM on the donor.",
                 },
             )
             inputs["optional"]["expert_mode_allocations"] = (
@@ -396,7 +396,7 @@ def override_class_with_distorch_gguf_v2(cls):
             compute_device=None,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="mixed",
+            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             **kwargs,
         ):

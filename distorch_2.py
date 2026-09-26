@@ -72,6 +72,11 @@ def _is_hip_software_gemm_device(device):
     return arch in _HIP_SOFTWARE_GEMM_ARCHITECTURES
 
 
+def _is_comfy_kitchen_attention_enabled():
+    enabled = getattr(mm, "comfy_kitchen_attention_enabled", None)
+    return callable(enabled) and enabled()
+
+
 def _is_eligible_donor_gemm(module, execution_mode):
     weight = getattr(module, "weight", None)
     return isinstance(weight, torch.Tensor) and weight.ndim == 2
@@ -84,34 +89,40 @@ def _is_large_donor_gemm(module):
 
 def _can_tile_linear_on_compute(module):
     weight = module.weight
-    return (
-        isinstance(module, torch.nn.Linear)
-        and weight.ndim == 2
-        and not hasattr(weight, "tensor_type")
-        and weight.shape == (module.out_features, module.in_features)
+    if not isinstance(module, torch.nn.Linear) or weight.ndim != 2:
+        return False
+    if callable(getattr(module, "cast_bias_weight", None)):
+        return True
+    return not hasattr(weight, "tensor_type") and weight.shape == (
+        module.out_features,
+        module.in_features,
     )
 
 
-def _run_tiled_linear_on_compute(input_tensor, module, compute_device):
+def _run_tiled_linear_on_compute(
+    input_tensor, module, compute_device, weight=None, bias=None, prepared=False
+):
     """Stream a donor linear weight to the compute GPU by output-channel tiles."""
-    weight = module.weight
+    weight = module.weight if weight is None else weight
+    bias = getattr(module, "bias", None) if bias is None else bias
     rows_per_tile = max(
         1, _HIP_DONOR_GEMM_MAX_WEIGHT_BYTES // (weight.shape[1] * weight.element_size())
     )
     compute_input = input_tensor.to(device=compute_device)
     output_tiles = []
-    bias = getattr(module, "bias", None)
 
     for start in range(0, weight.shape[0], rows_per_tile):
         end = min(start + rows_per_tile, weight.shape[0])
-        weight_tile = weight[start:end].to(
-            device=compute_device, dtype=compute_input.dtype
-        )
+        weight_tile = weight[start:end].to(device=compute_device)
+        if not prepared:
+            weight_tile = weight_tile.to(dtype=compute_input.dtype)
         bias_tile = (
-            bias[start:end].to(device=compute_device, dtype=compute_input.dtype)
+            bias[start:end].to(device=compute_device)
             if isinstance(bias, torch.Tensor)
             else None
         )
+        if bias_tile is not None and not prepared:
+            bias_tile = bias_tile.to(dtype=compute_input.dtype)
         output_tiles.append(
             torch.nn.functional.linear(compute_input, weight_tile, bias_tile)
         )
@@ -119,26 +130,134 @@ def _run_tiled_linear_on_compute(input_tensor, module, compute_device):
     return torch.cat(output_tiles, dim=-1)
 
 
+def _materialize_linear_on_donor(module, dtype, donor_device):
+    """Apply ComfyUI weight casts and patches on the donor before transfer."""
+    module_cast_bias_weight = getattr(module, "cast_bias_weight", None)
+    if callable(module_cast_bias_weight):
+        weight, bias = module_cast_bias_weight(dtype=dtype, device=donor_device)
+        return weight, bias, None
+
+    needs_materialization = (
+        getattr(module, "comfy_cast_weights", False)
+        or bool(getattr(module, "weight_function", ()))
+        or bool(getattr(module, "bias_function", ()))
+    )
+    if not needs_materialization:
+        weight = module.weight.to(device=donor_device, dtype=dtype)
+        bias = getattr(module, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            bias = bias.to(device=donor_device, dtype=dtype)
+        return weight, bias, None
+
+    from comfy.ops import cast_bias_weight
+
+    weight, bias, offload_state = cast_bias_weight(
+        module,
+        dtype=dtype,
+        device=donor_device,
+        bias_dtype=dtype,
+        offloadable=True,
+    )
+    return weight, bias, offload_state
+
+
+def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
+    """Confirm once that the donor materialized the weight before compute transfer."""
+    if getattr(module, "_mgpu_donor_preparation_logged", False):
+        return
+
+    operations = ["dtype cast"]
+    if used_comfy_cast:
+        operations.append("ComfyUI weight functions")
+    if hasattr(module.weight, "dequantize"):
+        operations.append("dequantization")
+    if getattr(module, "weight_function", ()):
+        operations.append("weight patches")
+    if getattr(module, "bias_function", ()):
+        operations.append("bias patches")
+
+    logger.info(
+        "[MultiGPU DisTorch V2] Donor preparation confirmed on %s: %s; "
+        "prepared weight is on %s (%s, %.2f MiB) before compute-GPU GEMM",
+        donor_device,
+        ", ".join(operations),
+        weight.device,
+        weight.dtype,
+        weight.numel() * weight.element_size() / (1024**2),
+    )
+    module._mgpu_donor_preparation_logged = True
+
+
+def _run_donor_prepared_linear_on_compute(
+    input_tensor, module, compute_device, donor_device
+):
+    """Prepare weights on the donor and run every linear tile on the compute GPU."""
+    compute_input = input_tensor.to(device=compute_device)
+    used_comfy_cast = (
+        getattr(module, "comfy_cast_weights", False)
+        or bool(getattr(module, "weight_function", ()))
+        or bool(getattr(module, "bias_function", ()))
+    )
+    weight, bias, offload_state = _materialize_linear_on_donor(
+        module, compute_input.dtype, donor_device
+    )
+    try:
+        _log_donor_preparation(module, donor_device, weight, used_comfy_cast)
+        return _run_tiled_linear_on_compute(
+            compute_input,
+            module,
+            compute_device,
+            weight=weight,
+            bias=bias,
+            prepared=True,
+        )
+    finally:
+        if offload_state is not None:
+            from comfy.ops import uncast_bias_weight
+
+            uncast_bias_weight(module, weight, bias, offload_state)
+
+
 def configure_hip_donor_gemm_offload(
-    module, compute_device, donor_device, execution_mode="mixed"
+    module, compute_device, donor_device, execution_mode="disabled"
 ):
     """Run an eligible donor-assigned software-GEMM module on its donor GPU."""
     original_forward = getattr(module, "_mgpu_original_forward", None)
     compute_device = torch.device(compute_device)
     donor_device = torch.device(donor_device)
-    enabled = (
-        donor_device != compute_device
-        and _is_hip_software_gemm_device(compute_device)
-        and _is_hip_software_gemm_device(donor_device)
-        and execution_mode in _HIP_DONOR_GEMM_EXECUTION_MODES
-        and _is_eligible_donor_gemm(module, execution_mode)
-    )
+    reasons = []
+    if donor_device == compute_device:
+        reasons.append("donor and compute devices are the same")
+    if not _is_hip_software_gemm_device(compute_device):
+        reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
+    if not _is_hip_software_gemm_device(donor_device):
+        reasons.append(f"donor device {donor_device} lacks HIP software GEMM")
+    if execution_mode not in _HIP_DONOR_GEMM_EXECUTION_MODES:
+        reasons.append(f"execution mode is {execution_mode!r}")
+    if not _is_comfy_kitchen_attention_enabled():
+        reasons.append("Comfy Kitchen attention is disabled")
+    if not _is_eligible_donor_gemm(module, execution_mode):
+        reasons.append("module weight is not a 2D tensor")
+    elif execution_mode == "mixed" and not _can_tile_linear_on_compute(module):
+        reasons.append("module cannot materialize a standard linear weight")
+    enabled = not reasons
 
     if not enabled:
+        if execution_mode == "mixed":
+            reason = "; ".join(reasons)
+            if getattr(module, "_mgpu_donor_skip_reason", None) != reason:
+                logger.info(
+                    "[MultiGPU DisTorch V2] Mixed donor preparation skipped for %s: %s",
+                    type(module).__name__,
+                    reason,
+                )
+                module._mgpu_donor_skip_reason = reason
         if original_forward is not None:
             module.forward = original_forward
             del module._mgpu_original_forward
             del module._mgpu_donor_execution_device
+            if hasattr(module, "_mgpu_donor_preparation_logged"):
+                del module._mgpu_donor_preparation_logged
         return False
 
     if original_forward is None:
@@ -151,19 +270,20 @@ def configure_hip_donor_gemm_offload(
             execution_mode = module._mgpu_donor_execution_mode
             if (
                 execution_mode == "mixed"
-                and _is_large_donor_gemm(module)
-                and _can_tile_linear_on_compute(module)
                 and len(args) == 1
                 and isinstance(args[0], torch.Tensor)
                 and not kwargs
             ):
-                output = _run_tiled_linear_on_compute(
-                    args[0], module, module._mgpu_compute_device
+                output = _run_donor_prepared_linear_on_compute(
+                    args[0],
+                    module,
+                    module._mgpu_compute_device,
+                    target_device,
                 )
                 module._mgpu_donor_gemm_calls += 1
                 if module._mgpu_donor_gemm_calls == 1:
                     logger.info(
-                        "[MultiGPU DisTorch V2] Tiled donor GEMM active: %s -> %s (%s)",
+                        "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s)",
                         target_device,
                         module._mgpu_compute_device,
                         type(module).__name__,
@@ -189,6 +309,8 @@ def configure_hip_donor_gemm_offload(
     module._mgpu_compute_device = compute_device
     module._mgpu_donor_execution_device = donor_device
     module._mgpu_donor_execution_mode = execution_mode
+    if hasattr(module, "_mgpu_donor_skip_reason"):
+        del module._mgpu_donor_skip_reason
     return True
 
 
@@ -494,7 +616,7 @@ def register_patched_safetensor_modelpatcher():
 
             allocations = inner_model._distorch_v2_meta["full_allocation"]
             donor_gemm_execution_mode = inner_model._distorch_v2_meta.get(
-                "donor_gemm_execution_mode", "mixed"
+                "donor_gemm_execution_mode", "disabled"
             )
 
             if not hasattr(self.model, "_distorch_high_precision_loras"):

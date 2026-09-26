@@ -106,11 +106,17 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             mock.patch.object(
                 self.distorch, "_is_hip_software_gemm_device", return_value=True
             ),
+            mock.patch.object(
+                self.distorch.mm,
+                "comfy_kitchen_attention_enabled",
+                return_value=True,
+                create=True,
+            ),
             mock.patch.object(self.distorch, "_move_tensors", side_effect=record_move),
         ):
             self.assertTrue(
                 self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1"
+                    module, "cuda:0", "cuda:1", execution_mode="all"
                 )
             )
             result = module.forward(torch.tensor(3), scale=2)
@@ -128,8 +134,15 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         with mock.patch.object(
             self.distorch, "_is_hip_software_gemm_device", return_value=True
+        ), mock.patch.object(
+            self.distorch.mm,
+            "comfy_kitchen_attention_enabled",
+            return_value=True,
+            create=True,
         ):
-            self.distorch.configure_hip_donor_gemm_offload(module, "cuda:0", "cuda:1")
+            self.distorch.configure_hip_donor_gemm_offload(
+                module, "cuda:0", "cuda:1", execution_mode="mixed"
+            )
             self.assertFalse(
                 self.distorch.configure_hip_donor_gemm_offload(
                     module, "cuda:0", "cuda:0"
@@ -145,6 +158,40 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         with mock.patch.object(
             self.distorch, "_is_hip_software_gemm_device", return_value=True
+        ), mock.patch.object(
+            self.distorch.mm,
+            "comfy_kitchen_attention_enabled",
+            return_value=True,
+            create=True,
+        ):
+            self.assertFalse(
+                self.distorch.configure_hip_donor_gemm_offload(
+                    module, "cuda:0", "cuda:1", execution_mode="mixed"
+                )
+            )
+
+    def test_mixed_mode_accepts_large_gemms_for_tiled_execution(self):
+        module = torch.nn.Linear(1, 16 * 1024 * 1024 // 4 + 1, bias=False)
+
+        with mock.patch.object(
+            self.distorch, "_is_hip_software_gemm_device", return_value=True
+        ), mock.patch.object(
+            self.distorch.mm,
+            "comfy_kitchen_attention_enabled",
+            return_value=True,
+            create=True,
+        ):
+            self.assertTrue(
+                self.distorch.configure_hip_donor_gemm_offload(
+                    module, "cuda:0", "cuda:1", execution_mode="mixed"
+                )
+            )
+
+    def test_disabled_mode_does_not_enable_donor_gemm(self):
+        module = DonorModule()
+
+        with mock.patch.object(
+            self.distorch, "_is_hip_software_gemm_device", return_value=True
         ):
             self.assertFalse(
                 self.distorch.configure_hip_donor_gemm_offload(
@@ -152,19 +199,15 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                 )
             )
 
-    def test_mixed_mode_accepts_large_gemms_for_tiled_execution(self):
+    def test_mixed_mode_requires_comfy_kitchen_attention(self):
         module = DonorModule()
-        module.weight = torch.empty(
-            16 * 1024 * 1024 // 4 + 1,
-            dtype=torch.float32,
-        ).reshape(-1, 1)
 
         with mock.patch.object(
             self.distorch, "_is_hip_software_gemm_device", return_value=True
         ):
-            self.assertTrue(
+            self.assertFalse(
                 self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1"
+                    module, "cuda:0", "cuda:1", execution_mode="mixed"
                 )
             )
 
@@ -180,6 +223,70 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertTrue(torch.allclose(output, module(input_tensor)))
         self.assertEqual(output.shape, (2, 5))
 
+    def test_donor_prepared_linear_matches_full_linear(self):
+        module = torch.nn.Linear(3, 5, bias=True)
+        input_tensor = torch.randn(2, 3)
+
+        with self.assertLogs("MultiGPU", level="INFO") as logs:
+            output = self.distorch._run_donor_prepared_linear_on_compute(
+                input_tensor, module, "cpu", "cpu"
+            )
+
+        self.assertTrue(torch.allclose(output, module(input_tensor)))
+        self.assertEqual(output.shape, (2, 5))
+        self.assertIn("Donor preparation confirmed on cpu", logs.output[0])
+        self.assertIn("prepared weight is on cpu", logs.output[0])
+
+    def test_materializes_cast_weights_on_donor(self):
+        module = torch.nn.Linear(3, 5, bias=True)
+        module.comfy_cast_weights = True
+        module.weight_function = []
+        module.bias_function = []
+        input_tensor = torch.randn(2, 3)
+        calls = []
+        comfy_ops = types.ModuleType("comfy.ops")
+
+        def cast_bias_weight(module, **kwargs):
+            calls.append(kwargs)
+            return module.weight + 1, module.bias, "offload-state"
+
+        comfy_ops.cast_bias_weight = cast_bias_weight
+        comfy_ops.uncast_bias_weight = lambda *args: calls.append("uncast")
+
+        with mock.patch.dict(sys.modules, {"comfy.ops": comfy_ops}):
+            output = self.distorch._run_donor_prepared_linear_on_compute(
+                input_tensor, module, "cpu", "cpu"
+            )
+
+        self.assertTrue(
+            torch.allclose(
+                output, functional.linear(input_tensor, module.weight + 1, module.bias)
+            )
+        )
+        self.assertEqual(calls[0]["device"], "cpu")
+        self.assertTrue(calls[0]["offloadable"])
+        self.assertEqual(calls[1], "uncast")
+
+    def test_mixed_mode_requires_standard_linear_tiling(self):
+        module = DonorModule()
+
+        with (
+            mock.patch.object(
+                self.distorch, "_is_hip_software_gemm_device", return_value=True
+            ),
+            mock.patch.object(
+                self.distorch.mm,
+                "comfy_kitchen_attention_enabled",
+                return_value=True,
+                create=True,
+            ),
+        ):
+            self.assertFalse(
+                self.distorch.configure_hip_donor_gemm_offload(
+                    module, "cuda:0", "cuda:1", execution_mode="mixed"
+                )
+            )
+
     def test_rejects_packed_linear_weight_for_compute_tiling(self):
         module = torch.nn.Linear(1, 1, bias=False)
         module.in_features = 5376
@@ -188,6 +295,30 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         module.weight.tensor_type = "Q4_K"
 
         self.assertFalse(self.distorch._can_tile_linear_on_compute(module))
+
+    def test_accepts_packed_linear_with_donor_materializer(self):
+        module = torch.nn.Linear(1, 1, bias=False)
+        module.in_features = 5376
+        module.out_features = 16128
+        module.weight = torch.nn.Parameter(torch.empty(3024, 3120, device="meta"))
+        module.weight.tensor_type = "Q4_K"
+        module.cast_bias_weight = lambda **kwargs: (module.weight, None)
+
+        self.assertTrue(self.distorch._can_tile_linear_on_compute(module))
+
+    def test_logs_mixed_mode_eligibility_rejection(self):
+        module = DonorModule()
+
+        with self.assertLogs("MultiGPU", level="INFO") as logs:
+            self.assertFalse(
+                self.distorch.configure_hip_donor_gemm_offload(
+                    module, "cuda:0", "cuda:1", execution_mode="mixed"
+                )
+            )
+
+        self.assertIn("Mixed donor preparation skipped", logs.output[0])
+        self.assertIn("Comfy Kitchen attention is disabled", logs.output[0])
+        self.assertIn("cannot materialize a standard linear weight", logs.output[0])
 
     def test_invalid_expert_allocation_uses_virtual_vram_donor(self):
         module = AllocationModule()
@@ -225,10 +356,30 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             dtype=torch.float32,
         ).reshape(-1, 1)
 
+        with (
+            mock.patch.object(
+                self.distorch, "_is_hip_software_gemm_device", return_value=True
+            ),
+            mock.patch.object(
+                self.distorch.mm,
+                "comfy_kitchen_attention_enabled",
+                return_value=True,
+                create=True,
+            ),
+        ):
+            self.assertTrue(
+                self.distorch.configure_hip_donor_gemm_offload(
+                    module, "cuda:0", "cuda:1", execution_mode="all"
+                )
+            )
+
+    def test_all_mode_requires_comfy_kitchen_attention(self):
+        module = DonorModule()
+
         with mock.patch.object(
             self.distorch, "_is_hip_software_gemm_device", return_value=True
         ):
-            self.assertTrue(
+            self.assertFalse(
                 self.distorch.configure_hip_donor_gemm_offload(
                     module, "cuda:0", "cuda:1", execution_mode="all"
                 )
@@ -254,6 +405,8 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             and self.distorch._is_hip_software_gemm_device("cuda:1")
         ):
             self.skipTest("requires two HIP software-GEMM GPUs")
+        if not self.distorch._is_comfy_kitchen_attention_enabled():
+            self.skipTest("requires Comfy Kitchen attention")
 
         compute_device = torch.device("cuda:0")
         donor_device = torch.device("cuda:1")
@@ -262,7 +415,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertTrue(
             self.distorch.configure_hip_donor_gemm_offload(
-                module, compute_device, donor_device
+                module, compute_device, donor_device, execution_mode="mixed"
             )
         )
         result = module.forward(input_tensor)

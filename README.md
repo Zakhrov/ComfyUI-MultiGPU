@@ -46,7 +46,7 @@ For VRAM-constrained systems, use Expert Mode to place a meaningful group of mod
 
 Donor execution trades transfer bandwidth and latency for lower peak VRAM on the compute GPU. DisTorch2 nodes provide a `donor_gemm_execution_mode` selector:
 
-- **mixed** (default): lightweight donor-assigned linear GEMMs execute on the donor. For larger standard linear layers, DisTorch streams output-channel weight tiles to the compute GPU and runs each tile there, limiting the compute GPU's temporary weight allocation while keeping both GPUs busy.
+- **mixed** (default): standard donor-assigned linear layers materialize, dequantize, and apply weight patches on the donor GPU. DisTorch then streams prepared output-channel weight tiles to the compute GPU, where every GEMM executes. This reserves the compute GPU for matrix multiplication while keeping dequantization and other weight element-wise work on the donor.
 - **all**: every eligible donor-resident linear GEMM executes entirely on the donor. Use this when the donor can complete even large GEMMs quickly enough that avoiding transfers is preferable.
 
 Both modes require compute and donor GPUs that use the HIP software-GEMM path. Look for `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1` in the ComfyUI log to confirm that the donor path was invoked.

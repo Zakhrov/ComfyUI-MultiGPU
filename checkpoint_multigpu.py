@@ -198,7 +198,7 @@ def patched_load_state_dict_guess_config(
                     inner_model._distorch_v2_meta = {
                         "full_allocation": unet_alloc,
                         "donor_gemm_execution_mode": distorch_config.get(
-                            "donor_gemm_execution_mode", "mixed"
+                            "donor_gemm_execution_mode", "disabled"
                         ),
                     }
                     logger.info(
@@ -279,7 +279,7 @@ def patched_load_state_dict_guess_config(
                             inner_clip._distorch_v2_meta = {
                                 "full_allocation": clip_alloc,
                                 "donor_gemm_execution_mode": distorch_config.get(
-                                    "donor_gemm_execution_mode", "mixed"
+                                    "donor_gemm_execution_mode", "disabled"
                                 ),
                             }
                             logger.info(
@@ -369,10 +369,10 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
                 ),
                 "unet_donor_device": (devices, {"default": "cpu"}),
                 "donor_gemm_execution_mode": (
-                    ["mixed", "all"],
+                    ["disabled", "mixed", "all"],
                     {
-                        "default": "mixed",
-                        "tooltip": "mixed runs lightweight GEMMs on the donor and streams large linear GEMM tiles to the compute GPU; all runs every GEMM on the donor.",
+                        "default": "disabled",
+                        "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; all runs every eligible GEMM on the donor.",
                     },
                 ),
                 "clip_compute_device": (devices, {"default": "cpu"}),
