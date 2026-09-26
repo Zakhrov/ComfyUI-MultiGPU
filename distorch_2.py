@@ -3,6 +3,9 @@ DisTorch Safetensor Memory Management Module
 Contains all safetensor related code for distributed memory management
 """
 
+import functools
+import itertools
+import math
 import torch
 import logging
 import re
@@ -31,8 +34,17 @@ _HIP_SOFTWARE_GEMM_ARCHITECTURES = frozenset(
         "gfx1036",
     }
 )
-_HIP_DONOR_GEMM_MAX_WEIGHT_BYTES = 16 * 1024 * 1024
-_HIP_DONOR_GEMM_EXECUTION_MODES = ("mixed", "all")
+# Headroom left free on the compute GPU for GEMM workspaces PyTorch cannot see.
+_COMPUTE_GPU_RESERVE_BYTES = 512 * 1024 * 1024
+# Attention sizes chunks from its measured peak, which includes the backend's
+# workspace, so it needs less headroom.
+_ATTENTION_RESERVE_BYTES = 128 * 1024 * 1024
+# Conv tiles stop getting faster well below this, and larger ones let the
+# backend's im2col workspace exhaust the compute GPU. A fixed cap also keeps
+# tile shapes stable so MIOpen reuses its tuned kernels between runs.
+_CONV_TILE_BUDGET_BYTES = 128 * 1024 * 1024
+# Below this many queries per chunk, per-call overhead makes the donor faster.
+_MIN_ATTENTION_CHUNK_TOKENS = 256
 
 
 def unpack_load_item(item):
@@ -77,14 +89,9 @@ def _is_comfy_kitchen_attention_enabled():
     return callable(enabled) and enabled()
 
 
-def _is_eligible_donor_gemm(module, execution_mode):
+def _is_eligible_donor_gemm(module):
     weight = getattr(module, "weight", None)
     return isinstance(weight, torch.Tensor) and weight.ndim == 2
-
-
-def _is_large_donor_gemm(module):
-    weight = module.weight
-    return weight.numel() * weight.element_size() > _HIP_DONOR_GEMM_MAX_WEIGHT_BYTES
 
 
 def _can_tile_linear_on_compute(module):
@@ -99,35 +106,296 @@ def _can_tile_linear_on_compute(module):
     )
 
 
-def _run_tiled_linear_on_compute(
-    input_tensor, module, compute_device, weight=None, bias=None, prepared=False
-):
-    """Stream a donor linear weight to the compute GPU by output-channel tiles."""
-    weight = module.weight if weight is None else weight
-    bias = getattr(module, "bias", None) if bias is None else bias
-    rows_per_tile = max(
-        1, _HIP_DONOR_GEMM_MAX_WEIGHT_BYTES // (weight.shape[1] * weight.element_size())
+def _can_tile_conv_on_compute(module):
+    return (
+        isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d))
+        and module.groups == 1
+        and not isinstance(module.padding, str)
     )
-    compute_input = input_tensor.to(device=compute_device)
-    output_tiles = []
 
-    for start in range(0, weight.shape[0], rows_per_tile):
-        end = min(start + rows_per_tile, weight.shape[0])
-        weight_tile = weight[start:end].to(device=compute_device)
-        if not prepared:
-            weight_tile = weight_tile.to(dtype=compute_input.dtype)
-        bias_tile = (
-            bias[start:end].to(device=compute_device)
-            if isinstance(bias, torch.Tensor)
-            else None
-        )
-        if bias_tile is not None and not prepared:
-            bias_tile = bias_tile.to(dtype=compute_input.dtype)
-        output_tiles.append(
-            torch.nn.functional.linear(compute_input, weight_tile, bias_tile)
-        )
 
-    return torch.cat(output_tiles, dim=-1)
+def _donor_gemm_skip_reasons(compute_device, donor_device):
+    reasons = []
+    if donor_device == compute_device:
+        reasons.append("donor and compute devices are the same")
+    if not _is_hip_software_gemm_device(compute_device):
+        reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
+    if not _is_hip_software_gemm_device(donor_device):
+        reasons.append(f"donor device {donor_device} lacks HIP software GEMM")
+    return reasons
+
+
+def _compute_budget(compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
+    """Bytes of compute-GPU VRAM one GEMM or attention call may use for tiles."""
+    # Release cached blocks first: the cudaMallocAsync pool (--cuda-malloc) keeps
+    # freed tiles and cannot serve a larger request from them, so they are only
+    # free once returned to the driver. Blocks still read by pending copies to
+    # or from the donor are only released once every device has synchronized.
+    if torch.device(compute_device).type == "cuda":
+        for index in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(index)
+    torch.cuda.empty_cache()
+    return max(0, mm.get_free_memory(compute_device) - reserve)
+
+
+def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
+    """Run a linear on the compute GPU in tiles sized to its free VRAM.
+
+    The input and output stay on the input's device; only token chunks, weight
+    tiles and their GEMM results visit the compute GPU.
+    """
+    flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
+    tokens, in_features = flat_input.shape
+    out_features = weight.shape[0]
+    output = torch.empty(
+        (tokens, out_features), device=input_tensor.device, dtype=input_tensor.dtype
+    )
+    row_bytes = in_features * weight.element_size()
+    budget = _compute_budget(compute_device)
+
+    # Keep the whole weight on the compute GPU when it takes at most half the
+    # budget; otherwise stream output-channel tiles for every token chunk.
+    rows_per_tile = min(out_features, max(1, budget // 2 // row_bytes))
+    tokens_per_chunk = min(
+        tokens,
+        max(
+            1,
+            (budget - rows_per_tile * row_bytes)
+            // ((in_features + rows_per_tile) * output.element_size()),
+        ),
+    )
+    # Allocate the tile buffers once and reuse them: a cudaMallocAsync pool
+    # (--cuda-malloc) cannot serve a differently sized chunk from freed ones.
+    weight_buffer = torch.empty(
+        (rows_per_tile, in_features), device=compute_device, dtype=weight.dtype
+    )
+    input_buffer = torch.empty(
+        (tokens_per_chunk, in_features), device=compute_device, dtype=output.dtype
+    )
+    output_buffer = torch.empty(
+        tokens_per_chunk * rows_per_tile, device=compute_device, dtype=output.dtype
+    )
+    if isinstance(bias, torch.Tensor):
+        bias = bias.to(device=compute_device)
+    resident = rows_per_tile == out_features
+    if resident:
+        weight_buffer.copy_(weight)
+
+    with torch.cuda.device_of(input_buffer):
+        for token_start in range(0, tokens, tokens_per_chunk):
+            token_end = min(token_start + tokens_per_chunk, tokens)
+            input_chunk = input_buffer[: token_end - token_start]
+            input_chunk.copy_(flat_input[token_start:token_end])
+            for start in range(0, out_features, rows_per_tile):
+                end = min(start + rows_per_tile, out_features)
+                weight_tile = weight_buffer[: end - start]
+                if not resident:
+                    weight_tile.copy_(weight[start:end])
+                output_tile = output_buffer[: input_chunk.shape[0] * (end - start)].view(
+                    input_chunk.shape[0], end - start
+                )
+                if bias is None:
+                    torch.mm(input_chunk, weight_tile.t(), out=output_tile)
+                else:
+                    torch.addmm(bias[start:end], input_chunk, weight_tile.t(), out=output_tile)
+                output[token_start:token_end, start:end].copy_(output_tile)
+
+    return output.reshape(*input_tensor.shape[:-1], out_features)
+
+
+def _run_tiled_conv_on_compute(
+    input_tensor, weight, bias, stride, padding, dilation, compute_device
+):
+    """Run a zero-padded conv2d or conv3d on the compute GPU in tiles.
+
+    The input and output stay on the input's device. Every spatial dim but the
+    width is tiled; each tile copies only the input it reads, including the
+    kernel halo, and padding is applied on the compute GPU.
+    """
+    batch, channels, *size = input_tensor.shape
+    out_channels, _, *kernel = weight.shape
+    dims = len(size)
+    span = [d * (k - 1) + 1 for d, k in zip(dilation, kernel)]
+    out_size = [
+        (length + 2 * pad - extent) // step + 1
+        for length, pad, extent, step in zip(size, padding, span, stride)
+    ]
+    output = torch.empty(
+        (batch, out_channels, *out_size),
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    element_size = output.element_size()
+    channel_bytes = weight[0].numel() * weight.element_size()
+    budget = _CONV_TILE_BUDGET_BYTES
+    # Only pay for synchronizing every device when VRAM is actually short.
+    if mm.get_free_memory(compute_device) - _COMPUTE_GPU_RESERVE_BYTES < budget:
+        budget = min(budget, _compute_budget(compute_device))
+
+    channels_per_tile = min(out_channels, max(1, budget // 2 // channel_bytes))
+
+    def input_extent(chunk, dim):
+        return (chunk[dim] - 1) * stride[dim] + span[dim]
+
+    def tile_bytes(chunk):
+        input_elements = channels
+        for dim in range(dims):
+            input_elements *= input_extent(chunk, dim)
+        output_elements = 1
+        for length in chunk:
+            output_elements *= length
+        # Includes an im2col workspace in case the backend lowers the conv to a GEMM.
+        return (
+            input_elements + (channels_per_tile + weight[0].numel()) * output_elements
+        ) * element_size
+
+    # Halve the largest tiled dim until a tile fits; halving keeps the number
+    # of distinct tile shapes, and so backend kernel searches, small.
+    chunk = list(out_size)
+    tile_budget = budget - channels_per_tile * channel_bytes
+    while tile_bytes(chunk) > tile_budget and max(chunk[:-1]) > 1:
+        dim = max(range(dims - 1), key=lambda d: chunk[d])
+        chunk[dim] = -(-chunk[dim] // 2)
+
+    weight_buffer = torch.empty(
+        (channels_per_tile, *weight.shape[1:]), device=compute_device, dtype=weight.dtype
+    )
+    input_numel = channels
+    for dim in range(dims):
+        input_numel *= input_extent(chunk, dim)
+    input_buffer = torch.empty(input_numel, device=compute_device, dtype=output.dtype)
+    if isinstance(bias, torch.Tensor):
+        bias = bias.to(device=compute_device)
+    resident = channels_per_tile == out_channels
+    if resident:
+        weight_buffer.copy_(weight)
+    conv = torch.nn.functional.conv3d if dims == 3 else torch.nn.functional.conv2d
+    tile_starts = [range(0, out_size[dim], chunk[dim]) for dim in range(dims)]
+
+    with torch.cuda.device_of(input_buffer):
+        for sample in range(batch):
+            for starts in itertools.product(*tile_starts):
+                ends = [min(start + length, total) for start, length, total in zip(starts, chunk, out_size)]
+                tile_shape = [channels]
+                source = [slice(sample, sample + 1), slice(None)]
+                interior = [slice(None), slice(None)]
+                pads = []
+                for dim in range(dims):
+                    in_start = starts[dim] * stride[dim] - padding[dim]
+                    extent = (ends[dim] - starts[dim] - 1) * stride[dim] + span[dim]
+                    pad_before = max(0, -in_start)
+                    filled = extent - max(0, in_start + extent - size[dim])
+                    tile_shape.append(extent)
+                    source.append(slice(in_start + pad_before, in_start + filled))
+                    interior.append(slice(pad_before, filled))
+                    pads.append((pad_before, filled))
+                input_tile = input_buffer[: math.prod(tile_shape)].view(1, *tile_shape)
+                for dim, (pad_before, filled) in enumerate(pads):
+                    edge = [slice(None)] * (dims + 2)
+                    edge[dim + 2] = slice(None, pad_before)
+                    input_tile[tuple(edge)].zero_()
+                    edge[dim + 2] = slice(filled, None)
+                    input_tile[tuple(edge)].zero_()
+                input_tile[tuple(interior)].copy_(input_tensor[tuple(source)])
+                target = [slice(sample, sample + 1), None] + [
+                    slice(start, end) for start, end in zip(starts, ends)
+                ]
+                for start in range(0, out_channels, channels_per_tile):
+                    end = min(start + channels_per_tile, out_channels)
+                    weight_tile = weight_buffer[: end - start]
+                    if not resident:
+                        weight_tile.copy_(weight[start:end])
+                    target[1] = slice(start, end)
+                    output[tuple(target)].copy_(
+                        conv(
+                            input_tile,
+                            weight_tile,
+                            None if bias is None else bias[start:end],
+                            stride,
+                            0,
+                            dilation,
+                        )
+                    )
+
+    return output
+
+
+def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, mask=None, **kwargs):
+    """Run attention on the compute GPU in query chunks; K and V are copied once.
+
+    Chunks are sized from the measured memory of earlier chunks: a 1-token
+    probe gives the backend's fixed per-call cost, and a second chunk gives
+    the per-token cost. Queries that cannot be chunked efficiently in the
+    remaining VRAM run on the donor instead.
+    """
+    kv_bytes = (k.numel() + v.numel()) * k.element_size()
+    budget = _compute_budget(compute_device, _ATTENTION_RESERVE_BYTES) - kv_bytes
+    if mask is not None or budget <= 0:
+        return func(q, k, v, heads, *args, mask=mask, **kwargs)
+
+    seq_dim = 2 if kwargs.get("skip_reshape", False) else 1
+    out_dim = 2 if kwargs.get("skip_output_reshape", False) else 1
+    tokens = q.shape[seq_dim]
+    q_token_bytes = q.numel() // tokens * q.element_size()
+    # Used for the second chunk only: assumes the backend materializes scores,
+    # softmax and one temporary per query.
+    conservative_token_bytes = (
+        2 * q_token_bytes + 3 * q.shape[0] * heads * k.shape[seq_dim] * q.element_size()
+    )
+    measure_peak = compute_device.type == "cuda"
+    donor_k, donor_v = k, v
+    k = k.to(device=compute_device)
+    v = v.to(device=compute_device)
+    output = None
+    probes = []
+    use_donor = False
+    tokens_per_chunk = 1 if measure_peak else max(1, budget // conservative_token_bytes)
+    start = 0
+    while start < tokens:
+        length = min(tokens_per_chunk, tokens - start)
+        q_chunk = q.narrow(seq_dim, start, length)
+        on_compute = not use_donor
+        if on_compute:
+            q_chunk = q_chunk.to(device=compute_device)
+            if measure_peak:
+                torch.cuda.reset_peak_memory_stats(compute_device)
+                base = torch.cuda.memory_allocated(compute_device)
+            with torch.cuda.device_of(q_chunk):
+                out_chunk = func(q_chunk, k, v, heads, *args, mask=None, **kwargs)
+        else:
+            # Too little compute VRAM to amortize the per-call cost: finish on the donor.
+            del k, v
+            length = tokens - start
+            q_chunk = q.narrow(seq_dim, start, length)
+            with torch.cuda.device_of(q_chunk):
+                out_chunk = func(q_chunk, donor_k, donor_v, heads, *args, mask=None, **kwargs)
+        if output is None:
+            shape = list(out_chunk.shape)
+            shape[out_dim] = tokens
+            output = torch.empty(shape, device=q.device, dtype=out_chunk.dtype)
+        output.narrow(out_dim, start, length).copy_(out_chunk)
+        del q_chunk, out_chunk
+        start += length
+        if not (measure_peak and on_compute):
+            continue
+        used = torch.cuda.max_memory_allocated(compute_device) - base + length * q_token_bytes
+        # Re-read free memory each chunk so allocations outside PyTorch, such
+        # as a resident text encoder, shrink the next chunk.
+        budget = _compute_budget(compute_device, _ATTENTION_RESERVE_BYTES)
+        probes.append((length, used))
+        if len(probes) == 1:
+            tokens_per_chunk = max(2, (budget - used) // conservative_token_bytes)
+        elif length > probes[0][0]:
+            token_bytes = max(
+                q_token_bytes, (used - probes[0][1]) // (length - probes[0][0])
+            )
+            fixed_bytes = max(0, probes[0][1] - probes[0][0] * token_bytes)
+            fit = (budget - fixed_bytes) // token_bytes
+            use_donor = fit < _MIN_ATTENTION_CHUNK_TOKENS
+            # Small probes hide the per-token cost in allocator rounding, so grow
+            # at most 4x per chunk and re-measure before trusting the estimate.
+            tokens_per_chunk = max(1, min(fit, 4 * length))
+    return output
 
 
 def _materialize_linear_on_donor(module, dtype, donor_device):
@@ -191,31 +459,244 @@ def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
 def _run_donor_prepared_linear_on_compute(
     input_tensor, module, compute_device, donor_device
 ):
-    """Prepare weights on the donor and run every linear tile on the compute GPU."""
-    compute_input = input_tensor.to(device=compute_device)
+    """Prepare the weight on the donor and run its GEMM on the compute GPU."""
     used_comfy_cast = (
         getattr(module, "comfy_cast_weights", False)
         or bool(getattr(module, "weight_function", ()))
         or bool(getattr(module, "bias_function", ()))
     )
     weight, bias, offload_state = _materialize_linear_on_donor(
-        module, compute_input.dtype, donor_device
+        module, input_tensor.dtype, donor_device
     )
     try:
         _log_donor_preparation(module, donor_device, weight, used_comfy_cast)
-        return _run_tiled_linear_on_compute(
-            compute_input,
-            module,
-            compute_device,
-            weight=weight,
-            bias=bias,
-            prepared=True,
-        )
+        return _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device)
     finally:
         if offload_state is not None:
             from comfy.ops import uncast_bias_weight
 
             uncast_bias_weight(module, weight, bias, offload_state)
+
+
+def _configure_mixed_conv(module):
+    """Tile a conv's math onto the compute GPU below its own forward.
+
+    Hooking _conv_forward keeps layer-specific padding and temporal caches
+    (such as Wan's CausalConv3d) and ComfyUI's weight casts on the donor.
+    """
+    module._mgpu_original_conv_forward = module._conv_forward
+    module._mgpu_donor_gemm_calls = 0
+
+    def mixed_conv_forward(input, weight, bias, autopad=None):
+        padding = module.padding
+        if module.padding_mode != "zeros":
+            input = torch.nn.functional.pad(
+                input, module._reversed_padding_repeated_twice, mode=module.padding_mode
+            )
+            padding = (0,) * len(padding)
+        # Matches comfy.ops.Conv3d: the causal kernel is cut to the frames present.
+        if autopad == "causal_zero":
+            weight = weight[:, :, -input.shape[2] :]
+        output = _run_tiled_conv_on_compute(
+            input,
+            weight,
+            bias,
+            module.stride,
+            padding,
+            module.dilation,
+            module._mgpu_compute_device,
+        )
+        module._mgpu_donor_gemm_calls += 1
+        if module._mgpu_donor_gemm_calls == 1:
+            logger.info(
+                "[MultiGPU DisTorch V2] Donor-prepared compute conv active: %s -> %s (%s)",
+                input.device,
+                module._mgpu_compute_device,
+                type(module).__name__,
+            )
+        return output
+
+    module._conv_forward = mixed_conv_forward
+
+
+def configure_mixed_gemm(module, compute_device, donor_device):
+    """Run an eligible linear's or conv's GEMM on the compute GPU; its activations stay on the donor."""
+    if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
+        tileable = _can_tile_conv_on_compute(module)
+    elif _is_eligible_donor_gemm(module):
+        tileable = _can_tile_linear_on_compute(module)
+    else:
+        return False
+    if not tileable:
+        if not getattr(module, "_mgpu_donor_skip_logged", False):
+            logger.info(
+                "[MultiGPU DisTorch V2] Mixed compute GEMM skipped for %s: module is not a standard linear or ungrouped conv",
+                type(module).__name__,
+            )
+            module._mgpu_donor_skip_logged = True
+        return False
+
+    module._mgpu_compute_device = torch.device(compute_device)
+    if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
+        if not hasattr(module, "_mgpu_original_conv_forward"):
+            _configure_mixed_conv(module)
+        return True
+
+    module._mgpu_donor_execution_device = torch.device(donor_device)
+    if not hasattr(module, "_mgpu_original_forward"):
+        module._mgpu_original_forward = module.forward
+        module._mgpu_donor_gemm_calls = 0
+
+        def mixed_forward(*args, **kwargs):
+            if len(args) != 1 or kwargs or not isinstance(args[0], torch.Tensor):
+                return module._mgpu_original_forward(*args, **kwargs)
+            output = _run_donor_prepared_linear_on_compute(
+                args[0],
+                module,
+                module._mgpu_compute_device,
+                module._mgpu_donor_execution_device,
+            )
+            module._mgpu_donor_gemm_calls += 1
+            if module._mgpu_donor_gemm_calls == 1:
+                logger.info(
+                    "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s)",
+                    module._mgpu_donor_execution_device,
+                    module._mgpu_compute_device,
+                    type(module).__name__,
+                )
+            return output
+
+        module.forward = mixed_forward
+    return True
+
+
+def _first_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        value = value.values()
+    elif not isinstance(value, (tuple, list)):
+        return None
+    for item in value:
+        tensor = _first_tensor(item)
+        if tensor is not None:
+            return tensor
+    return None
+
+
+def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=False):
+    """Pick the donor GPU that holds a mixed-mode model's activations, or None."""
+    compute_device = torch.device(compute_device)
+    donors = sorted(
+        {str(device) for device in block_assignments.values()}
+        - {"cpu", str(compute_device)}
+    )
+    reasons = []
+    if not is_vae and not hasattr(model, "diffusion_model"):
+        reasons.append("model has no diffusion model or VAE")
+    # VAE attention stays on the donor, so only diffusion models need Kitchen attention.
+    if not is_vae and not _is_comfy_kitchen_attention_enabled():
+        reasons.append("Comfy Kitchen attention is disabled")
+    if not donors:
+        reasons.append("allocation has no donor GPU")
+    else:
+        reasons.extend(_donor_gemm_skip_reasons(compute_device, torch.device(donors[0])))
+    if reasons:
+        logger.info(
+            "[MultiGPU DisTorch V2] Mixed mode disabled: %s", "; ".join(reasons)
+        )
+        return None
+    return torch.device(donors[0])
+
+
+def configure_mixed_execution(diffusion_model, donor_device, compute_device):
+    """Run the diffusion model on the donor and send attention to the compute GPU.
+
+    Activations, norms, modulation, rope and weight preparation stay on the
+    donor. Linears and convs (see configure_mixed_gemm) and attention run their GEMMs on
+    the compute GPU in tiles sized to its free VRAM.
+    """
+    if not hasattr(diffusion_model, "_mgpu_original_forward"):
+        diffusion_model._mgpu_original_forward = diffusion_model.forward
+
+        def mixed_forward(*args, transformer_options={}, **kwargs):
+            donor = diffusion_model._mgpu_donor_execution_device
+            compute = diffusion_model._mgpu_compute_device
+            output_device = _first_tensor(args).device
+            transformer_options = transformer_options.copy()
+            previous_override = transformer_options.get("optimized_attention_override")
+
+            def attention_on_compute(func, *attention_args, **attention_kwargs):
+                if previous_override is not None:
+                    func = functools.partial(previous_override, func)
+                return _run_attention_on_compute(
+                    func, *attention_args, compute_device=compute, **attention_kwargs
+                )
+
+            transformer_options["optimized_attention_override"] = attention_on_compute
+            donor_args = _move_tensors(args, donor)
+            with torch.cuda.device_of(_first_tensor(donor_args)):
+                output = diffusion_model._mgpu_original_forward(
+                    *donor_args,
+                    transformer_options=transformer_options,
+                    **_move_tensors(kwargs, donor),
+                )
+            return _move_tensors(output, output_device)
+
+        diffusion_model.forward = mixed_forward
+        logger.info(
+            "[MultiGPU DisTorch V2] Mixed execution: activations on %s, GEMMs and attention on %s",
+            donor_device,
+            compute_device,
+        )
+
+    diffusion_model._mgpu_donor_execution_device = torch.device(donor_device)
+    diffusion_model._mgpu_compute_device = torch.device(compute_device)
+
+
+def configure_mixed_vae(vae_model, donor_device, compute_device):
+    """Run VAE encode and decode on the donor; conv and linear GEMMs go to the compute GPU.
+
+    Activations, norms, attention, upsampling and temporal caches stay on the
+    donor, so the compute GPU only holds conv tiles (see configure_mixed_gemm).
+    """
+    if not hasattr(vae_model, "_mgpu_original_methods"):
+        vae_model._mgpu_original_methods = {}
+
+        def donor_call(method):
+            def mixed_call(*args, **kwargs):
+                donor = vae_model._mgpu_donor_execution_device
+                output_device = _first_tensor(args).device
+                # Chunked-IO VAEs write straight into output_buffer and move
+                # their own chunks to the given device.
+                donor_kwargs = {
+                    key: value if key == "output_buffer" else _move_tensors(value, donor)
+                    for key, value in kwargs.items()
+                }
+                if "device" in kwargs:
+                    donor_kwargs["device"] = donor
+                donor_args = _move_tensors(args, donor)
+                with torch.cuda.device_of(_first_tensor(donor_args)):
+                    output = method(*donor_args, **donor_kwargs)
+                if output is kwargs.get("output_buffer"):
+                    return output
+                return _move_tensors(output, output_device)
+
+            return mixed_call
+
+        for name in ("encode", "decode", "encode_tiled", "decode_tiled"):
+            method = getattr(vae_model, name, None)
+            if callable(method):
+                vae_model._mgpu_original_methods[name] = method
+                setattr(vae_model, name, donor_call(method))
+        logger.info(
+            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, conv GEMMs on %s",
+            donor_device,
+            compute_device,
+        )
+
+    vae_model._mgpu_donor_execution_device = torch.device(donor_device)
+    vae_model._mgpu_compute_device = torch.device(compute_device)
 
 
 def configure_hip_donor_gemm_offload(
@@ -225,33 +706,14 @@ def configure_hip_donor_gemm_offload(
     original_forward = getattr(module, "_mgpu_original_forward", None)
     compute_device = torch.device(compute_device)
     donor_device = torch.device(donor_device)
-    reasons = []
-    if donor_device == compute_device:
-        reasons.append("donor and compute devices are the same")
-    if not _is_hip_software_gemm_device(compute_device):
-        reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
-    if not _is_hip_software_gemm_device(donor_device):
-        reasons.append(f"donor device {donor_device} lacks HIP software GEMM")
-    if execution_mode not in _HIP_DONOR_GEMM_EXECUTION_MODES:
-        reasons.append(f"execution mode is {execution_mode!r}")
-    if not _is_comfy_kitchen_attention_enabled():
-        reasons.append("Comfy Kitchen attention is disabled")
-    if not _is_eligible_donor_gemm(module, execution_mode):
-        reasons.append("module weight is not a 2D tensor")
-    elif execution_mode == "mixed" and not _can_tile_linear_on_compute(module):
-        reasons.append("module cannot materialize a standard linear weight")
-    enabled = not reasons
+    enabled = (
+        execution_mode == "all"
+        and _is_eligible_donor_gemm(module)
+        and _is_comfy_kitchen_attention_enabled()
+        and not _donor_gemm_skip_reasons(compute_device, donor_device)
+    )
 
     if not enabled:
-        if execution_mode == "mixed":
-            reason = "; ".join(reasons)
-            if getattr(module, "_mgpu_donor_skip_reason", None) != reason:
-                logger.info(
-                    "[MultiGPU DisTorch V2] Mixed donor preparation skipped for %s: %s",
-                    type(module).__name__,
-                    reason,
-                )
-                module._mgpu_donor_skip_reason = reason
         if original_forward is not None:
             module.forward = original_forward
             del module._mgpu_original_forward
@@ -267,29 +729,6 @@ def configure_hip_donor_gemm_offload(
 
         def donor_forward(*args, **kwargs):
             target_device = module._mgpu_donor_execution_device
-            execution_mode = module._mgpu_donor_execution_mode
-            if (
-                execution_mode == "mixed"
-                and len(args) == 1
-                and isinstance(args[0], torch.Tensor)
-                and not kwargs
-            ):
-                output = _run_donor_prepared_linear_on_compute(
-                    args[0],
-                    module,
-                    module._mgpu_compute_device,
-                    target_device,
-                )
-                module._mgpu_donor_gemm_calls += 1
-                if module._mgpu_donor_gemm_calls == 1:
-                    logger.info(
-                        "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s)",
-                        target_device,
-                        module._mgpu_compute_device,
-                        type(module).__name__,
-                    )
-                return output
-
             donor_args = _move_tensors(args, target_device)
             donor_kwargs = _move_tensors(kwargs, target_device)
             output = module._mgpu_original_forward(*donor_args, **donor_kwargs)
@@ -308,9 +747,6 @@ def configure_hip_donor_gemm_offload(
 
     module._mgpu_compute_device = compute_device
     module._mgpu_donor_execution_device = donor_device
-    module._mgpu_donor_execution_mode = execution_mode
-    if hasattr(module, "_mgpu_donor_skip_reason"):
-        del module._mgpu_donor_skip_reason
     return True
 
 
@@ -678,6 +1114,24 @@ def register_patched_safetensor_modelpatcher():
             high_precision_loras = getattr(
                 self.model, "_distorch_high_precision_loras", True
             )
+            # DisTorch2 VAE loaders patch the VAE's first_stage_model directly.
+            is_vae = (
+                not is_clip_model
+                and not hasattr(self.model, "diffusion_model")
+                and hasattr(self.model, "decode")
+            )
+            mixed_donor_device = None
+            if donor_gemm_execution_mode == "mixed":
+                mixed_donor_device = select_mixed_donor_device(
+                    self.model,
+                    device_assignments["block_assignments"],
+                    device_to,
+                    is_vae,
+                )
+            # Mixed mode keeps activations on the donor, so weights stored anywhere
+            # else are cast to it at runtime.
+            activation_device = mixed_donor_device or device_to
+
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
             loading.sort(reverse=True)
@@ -711,12 +1165,17 @@ def register_patched_safetensor_modelpatcher():
                         )
                         module_object.to(block_target_device)
 
-                    configure_hip_donor_gemm_offload(
-                        module_object,
-                        device_to,
-                        block_target_device,
-                        donor_gemm_execution_mode,
-                    )
+                    if mixed_donor_device is not None:
+                        configure_mixed_gemm(
+                            module_object, device_to, mixed_donor_device
+                        )
+                    else:
+                        configure_hip_donor_gemm_offload(
+                            module_object,
+                            device_to,
+                            block_target_device,
+                            donor_gemm_execution_mode,
+                        )
 
                     mem_counter += module_size
                     continue
@@ -773,7 +1232,7 @@ def register_patched_safetensor_modelpatcher():
                             )
 
                 # Step 4: Enable runtime weight casting for offloaded modules.
-                if str(block_target_device) != str(device_to):
+                if str(block_target_device) != str(activation_device):
                     if block_target_device == "cpu" and pin_hip_offloaded_weight(
                         module_object
                     ):
@@ -782,7 +1241,11 @@ def register_patched_safetensor_modelpatcher():
                         )
                     module_object.comfy_cast_weights = True
 
-                if configure_hip_donor_gemm_offload(
+                if mixed_donor_device is not None:
+                    configure_mixed_gemm(
+                        module_object, device_to, mixed_donor_device
+                    )
+                elif configure_hip_donor_gemm_offload(
                     module_object,
                     device_to,
                     block_target_device,
@@ -795,6 +1258,13 @@ def register_patched_safetensor_modelpatcher():
                 # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
                 mem_counter += module_size
+
+            if mixed_donor_device is not None and is_vae:
+                configure_mixed_vae(self.model, mixed_donor_device, device_to)
+            elif mixed_donor_device is not None:
+                configure_mixed_execution(
+                    self.model.diffusion_model, mixed_donor_device, device_to
+                )
 
             self.model.current_weight_patches_uuid = self.patches_uuid
 
