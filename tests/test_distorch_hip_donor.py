@@ -327,7 +327,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertEqual(donor, torch.device("cuda:1"))
 
-    def test_attention_runs_in_query_chunks(self):
+    def test_attention_chunks_heads_over_the_whole_sequence(self):
         q, k, v = (torch.randn(1, 2, 9, 4) for _ in range(3))
         calls = []
 
@@ -343,7 +343,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                 attention, q, k, v, 2, compute_device=torch.device("cpu"), plan={}, skip_reshape=True
             )
 
-        self.assertGreater(len(calls), 1)
+        self.assertEqual(calls, [9, 9])
         self.assertTrue(
             torch.allclose(output, attention(q, k, v, 2, skip_reshape=True), atol=1e-6)
         )
@@ -391,9 +391,8 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertTrue(
             torch.allclose(output, functional.scaled_dot_product_attention(q, k, v), atol=1e-6)
         )
-        chunk_heads, chunk_tokens, budget = plan[(q.shape, k.shape)]
-        self.assertLessEqual(chunk_heads * chunk_tokens, 4)
-        self.assertIsNone(budget)
+        chunk_heads, chunk_tokens = plan[(q.shape, k.shape)]
+        self.assertEqual((chunk_heads, chunk_tokens), (1, 4))
 
     def test_attention_falls_back_to_donor_when_nothing_fits(self):
         q, k, v = (torch.randn(1, 2, 4, 3) for _ in range(3))
@@ -483,13 +482,81 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertTrue(calls[0]["offloadable"])
         self.assertEqual(calls[1], "uncast")
 
-    def test_mixed_mode_keeps_castable_weights_in_system_ram(self):
+    def lora_adapter_module(self):
+        lora = types.ModuleType("comfy.weight_adapter.lora")
+
+        class LoRAAdapter:
+            def __init__(self, weights):
+                self.weights = weights
+
+        lora.LoRAAdapter = LoRAAdapter
+        return lora
+
+    def test_tiled_linear_applies_lora_as_low_rank_gemm(self):
+        weight, bias = torch.randn(5, 3), torch.randn(5)
+        up, down = torch.randn(5, 2), torch.randn(2, 3)
+        input_tensor = torch.randn(4, 3)
+        merged = weight + 0.25 * (up @ down)
+
+        with mock.patch.object(self.distorch, "_COMPUTE_GPU_RESERVE_BYTES", 0), mock.patch.object(
+            self.distorch.mm, "get_free_memory", lambda *_: 64
+        ):
+            output = self.distorch._run_tiled_linear_on_compute(
+                input_tensor, weight, bias, "cpu", [(down, up, 0.25)]
+            )
+
+        self.assertTrue(torch.allclose(output, functional.linear(input_tensor, merged, bias), atol=1e-5))
+
+    def test_donor_prepared_linear_moves_plain_lora_off_the_donor(self):
+        lora_module = self.lora_adapter_module()
+        up, down = torch.randn(5, 2), torch.randn(2, 3)
+        adapter = lora_module.LoRAAdapter((up, down, torch.tensor(4.0), None, None, None))
+        module = torch.nn.Linear(3, 5, bias=False).requires_grad_(False)
+        patches = [([(0.5, adapter, 1.0, None, None)], "linear.weight")]
+        module.weight.patches = patches
+        seen = []
+
+        def cast_bias_weight(dtype, device):
+            seen.append(list(module.weight.patches))
+            return module.weight, None
+
+        module.cast_bias_weight = cast_bias_weight
+        input_tensor = torch.randn(2, 3)
+
+        with mock.patch.dict(sys.modules, {"comfy.weight_adapter.lora": lora_module}):
+            output = self.distorch._run_donor_prepared_linear_on_compute(
+                input_tensor, module, "cpu", "cpu"
+            )
+
+        # scale = strength * alpha / rank = 0.5 * 4 / 2
+        expected = functional.linear(input_tensor, module.weight + 1.0 * (up @ down))
+        self.assertTrue(torch.allclose(output, expected, atol=1e-5))
+        self.assertEqual(seen, [[]])
+        self.assertIs(module.weight.patches, patches)
+
+    def test_non_plain_lora_patches_stay_merged(self):
+        lora_module = self.lora_adapter_module()
+        up, down = torch.randn(5, 2), torch.randn(2, 3)
+        weight = torch.nn.Parameter(torch.randn(5, 3), requires_grad=False)
+        dora = lora_module.LoRAAdapter((up, down, None, None, torch.ones(5), None))
+        weight.patches = [([(1.0, dora, 1.0, None, None)], "linear.weight")]
+
+        with mock.patch.dict(sys.modules, {"comfy.weight_adapter.lora": lora_module}):
+            self.assertEqual(self.distorch._plain_lora_patches(weight), ())
+            weight.patches = [([(1.0, object(), 1.0, None, None)], "linear.weight")]
+            self.assertEqual(self.distorch._plain_lora_patches(weight), ())
+
+    def test_mixed_mode_keeps_donor_layers_resident(self):
         donor = torch.device("cuda:1")
         self.assertEqual(
-            self.distorch._mixed_weight_device(AllocationModule(), donor), "cpu"
+            self.distorch._mixed_weight_device(AllocationModule(), "cuda:1", donor), donor
         )
+        for assigned in ("cuda:0", "cpu"):
+            self.assertEqual(
+                self.distorch._mixed_weight_device(AllocationModule(), assigned, donor), "cpu"
+            )
         self.assertEqual(
-            self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), donor), donor
+            self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), "cuda:0", donor), donor
         )
 
     def test_pinning_keeps_quantized_weight_metadata(self):

@@ -135,11 +135,13 @@ def _compute_budget(compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
     return max(0, mm.get_free_memory(compute_device) - reserve)
 
 
-def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
+def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lora=()):
     """Run a linear on the compute GPU in tiles sized to its free VRAM.
 
     The input and output stay on the input's device; only token chunks, weight
-    tiles and their GEMM results visit the compute GPU.
+    tiles and their GEMM results visit the compute GPU. lora holds (down, up,
+    scale) patches that are added as low-rank GEMMs instead of being merged
+    into the weight.
     """
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
     tokens, in_features = flat_input.shape
@@ -147,6 +149,17 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
     output = torch.empty(
         (tokens, out_features), device=input_tensor.device, dtype=input_tensor.dtype
     )
+    lora_down = lora_up = None
+    lora_rank = 0
+    if lora:
+        lora_down = torch.cat(
+            [down.to(device=compute_device, dtype=output.dtype) for down, _, _ in lora]
+        )
+        lora_up = torch.cat(
+            [up.to(device=compute_device, dtype=output.dtype) * scale for _, up, scale in lora],
+            dim=1,
+        )
+        lora_rank = lora_down.shape[0]
     row_bytes = in_features * weight.element_size()
     budget = _compute_budget(compute_device)
 
@@ -158,7 +171,7 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
         max(
             1,
             (budget - rows_per_tile * row_bytes)
-            // ((in_features + rows_per_tile) * output.element_size()),
+            // ((in_features + rows_per_tile + lora_rank) * output.element_size()),
         ),
     )
     # Allocate the tile buffers once and reuse them: a cudaMallocAsync pool
@@ -172,6 +185,9 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
     output_buffer = torch.empty(
         tokens_per_chunk * rows_per_tile, device=compute_device, dtype=output.dtype
     )
+    lora_buffer = torch.empty(
+        (tokens_per_chunk, lora_rank), device=compute_device, dtype=output.dtype
+    )
     if isinstance(bias, torch.Tensor):
         bias = bias.to(device=compute_device)
     resident = rows_per_tile == out_features
@@ -183,6 +199,9 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
             token_end = min(token_start + tokens_per_chunk, tokens)
             input_chunk = input_buffer[: token_end - token_start]
             input_chunk.copy_(flat_input[token_start:token_end])
+            if lora_down is not None:
+                lora_chunk = lora_buffer[: input_chunk.shape[0]]
+                torch.mm(input_chunk, lora_down.t(), out=lora_chunk)
             for start in range(0, out_features, rows_per_tile):
                 end = min(start + rows_per_tile, out_features)
                 weight_tile = weight_buffer[: end - start]
@@ -195,6 +214,8 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device):
                     torch.mm(input_chunk, weight_tile.t(), out=output_tile)
                 else:
                     torch.addmm(bias[start:end], input_chunk, weight_tile.t(), out=output_tile)
+                if lora_down is not None:
+                    output_tile.addmm_(lora_chunk, lora_up[start:end].t())
                 output[token_start:token_end, start:end].copy_(output_tile)
 
     return output.reshape(*input_tensor.shape[:-1], out_features)
@@ -318,14 +339,15 @@ def _run_tiled_conv_on_compute(
 
 
 def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan, mask=None, **kwargs):
-    """Run attention on the compute GPU in head and query chunks.
+    """Run attention on the compute GPU in head chunks over the whole sequence.
 
-    Heads are independent, so a chunk only copies its own heads' K and V. The
-    first chunk size assumes the backend materializes scores; query chunks
-    then grow while PyTorch's measured peak stays under half the budget, and
-    halve on OOM because backend workspaces are invisible to that measure.
-    The learned size is kept in plan for the forward's other layers. When one
-    head group and one query still do not fit, attention runs on the donor.
+    Heads are independent, so a chunk copies only its own heads' Q, K and V.
+    Every chunk takes all queries: backends prepare K and V on each call (Kitchen
+    int8 rotates and quantizes them), so query chunks would repeat that work.
+    The first chunk fits Q, K, V and the output twice in half the free VRAM.
+    On OOM it halves its heads, then its queries, and plan keeps the result
+    for later calls. When one head group and one query still do not fit,
+    attention runs on the donor.
     """
     key = (q.shape, k.shape)
     if mask is not None or plan.get(key, True) is None:
@@ -349,16 +371,13 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
     chunk = plan.get(key)
     if chunk is None:
         budget = _compute_budget(compute_device, _ATTENTION_RESERVE_BYTES)
-        element_size = q.element_size()
-        batch = q.shape[0]
-        group_kv_bytes = (k.numel() + v.numel()) // kv_heads * element_size
-        head_token_bytes = 3 * batch * (head_dim + k.shape[seq_dim]) * element_size
-        groups = max(1, min(kv_heads, budget // 2 // group_kv_bytes))
-        chunk_tokens = (budget - groups * group_kv_bytes) // (groups * group * head_token_bytes)
-        # [heads per chunk, queries per chunk, budget; None once an OOM stops growth]
-        chunk = plan[key] = [groups * group, min(tokens, max(1, chunk_tokens)), budget]
+        group_bytes = (
+            (k.numel() + v.numel()) // kv_heads + 3 * group * q.numel() // heads
+        ) * q.element_size()
+        groups = max(1, min(kv_heads, budget // 2 // group_bytes))
+        # [heads per chunk, queries per chunk]
+        chunk = plan[key] = [groups * group, tokens]
 
-    measure_peak = torch.device(compute_device).type == "cuda"
     output = None
     head = 0
     while head < heads:
@@ -372,9 +391,6 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
             out_chunk = None
             try:
                 q_chunk = q_chunk.to(device=compute_device)
-                if measure_peak:
-                    torch.cuda.reset_peak_memory_stats(compute_device)
-                    base = torch.cuda.memory_allocated(compute_device)
                 with torch.cuda.device_of(q_chunk):
                     out_chunk = func(q_chunk, k_chunk, v_chunk, count, *args, mask=None, **kwargs)
             except torch.OutOfMemoryError:
@@ -383,13 +399,12 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
             if out_chunk is None:
                 del q_chunk
                 torch.cuda.empty_cache()
-                chunk[2] = None
-                if chunk[1] > 1:
-                    chunk[1] = max(1, chunk[1] // 2)
-                    continue
                 if chunk[0] > group:
                     chunk[0] = max(group, chunk[0] // 2 // group * group)
                     break
+                if chunk[1] > 1:
+                    chunk[1] = max(1, chunk[1] // 2)
+                    continue
                 del k_chunk, v_chunk
                 plan[key] = None
                 logger.info(
@@ -408,12 +423,6 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
             ).copy_(out_chunk)
             del q_chunk, out_chunk
             start += length
-            if (
-                measure_peak
-                and chunk[2] is not None
-                and 2 * (torch.cuda.max_memory_allocated(compute_device) - base) < chunk[2]
-            ):
-                chunk[1] = min(tokens, 2 * chunk[1])
         else:
             head += count
         del k_chunk, v_chunk
@@ -478,6 +487,36 @@ def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
     module._mgpu_donor_preparation_logged = True
 
 
+def _plain_lora_patches(weight):
+    """A GGUF weight's LoRA patches as (down, up, scale), or () to merge them as usual.
+
+    The GGUF loader merges patches into the dequantized weight on every call,
+    which on the donor costs a full-size GEMM per LoRA. Plain LoRAs are
+    instead applied as two thin GEMMs on the compute GPU.
+    """
+    patches = getattr(weight, "patches", None)
+    if not patches:
+        return ()
+    from comfy.weight_adapter.lora import LoRAAdapter
+
+    lora = []
+    for patch_list, _ in patches:
+        for strength, adapter, strength_model, offset, function in patch_list:
+            if (
+                not isinstance(adapter, LoRAAdapter)
+                or strength_model != 1.0
+                or offset is not None
+                or function is not None
+            ):
+                return ()
+            up, down, alpha, mid, dora_scale, reshape = adapter.weights
+            if mid is not None or dora_scale is not None or reshape is not None or up.ndim != 2:
+                return ()
+            rank = down.shape[0]
+            lora.append((down, up, strength * (1.0 if alpha is None else float(alpha) / rank)))
+    return lora
+
+
 def _run_donor_prepared_linear_on_compute(
     input_tensor, module, compute_device, donor_device
 ):
@@ -487,12 +526,22 @@ def _run_donor_prepared_linear_on_compute(
         or bool(getattr(module, "weight_function", ()))
         or bool(getattr(module, "bias_function", ()))
     )
-    weight, bias, offload_state = _materialize_linear_on_donor(
-        module, input_tensor.dtype, donor_device
-    )
+    lora = _plain_lora_patches(module.weight)
+    if lora:
+        patches = module.weight.patches
+        module.weight.patches = []
+    try:
+        weight, bias, offload_state = _materialize_linear_on_donor(
+            module, input_tensor.dtype, donor_device
+        )
+    finally:
+        if lora:
+            module.weight.patches = patches
     try:
         _log_donor_preparation(module, donor_device, weight, used_comfy_cast)
-        return _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device)
+        return _run_tiled_linear_on_compute(
+            input_tensor, weight, bias, compute_device, lora
+        )
     finally:
         if offload_state is not None:
             from comfy.ops import uncast_bias_weight
@@ -606,14 +655,17 @@ def _first_tensor(value):
     return None
 
 
-def _mixed_weight_device(module, donor_device):
+def _mixed_weight_device(module, assigned_device, donor_device):
     """Where mixed mode stores a module's weights.
 
-    Castable weights stay in system RAM and are prepared one layer at a time on
-    the donor, which leaves donor memory for activations and the compute GPU
-    for GEMM tiles. Modules that cannot be cast at runtime live on the donor.
+    Layers the allocation gives the donor stay resident there; other castable
+    weights stay in system RAM and are prepared on the donor per call. Either
+    way the compute GPU only holds GEMM tiles. Modules that cannot be cast at
+    runtime live on the donor.
     """
-    return "cpu" if hasattr(module, "comfy_cast_weights") else donor_device
+    if str(assigned_device) == str(donor_device) or not hasattr(module, "comfy_cast_weights"):
+        return donor_device
+    return "cpu"
 
 
 def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=False):
@@ -657,7 +709,6 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device):
             output_device = _first_tensor(args).device
             transformer_options = transformer_options.copy()
             previous_override = transformer_options.get("optimized_attention_override")
-            attention_plan = {}
 
             def attention_on_compute(func, *attention_args, **attention_kwargs):
                 if previous_override is not None:
@@ -666,7 +717,7 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device):
                     func,
                     *attention_args,
                     compute_device=compute,
-                    plan=attention_plan,
+                    plan=diffusion_model._mgpu_attention_plan,
                     **attention_kwargs,
                 )
 
@@ -689,6 +740,8 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device):
 
     diffusion_model._mgpu_donor_execution_device = torch.device(donor_device)
     diffusion_model._mgpu_compute_device = torch.device(compute_device)
+    # Chunk sizes learned from OOMs, a few ints per attention shape, kept until the next load.
+    diffusion_model._mgpu_attention_plan = {}
 
 
 def configure_mixed_vae(vae_model, donor_device, compute_device):
@@ -1167,7 +1220,7 @@ def register_patched_safetensor_modelpatcher():
             activation_device = mixed_donor_device or device_to
             if mixed_donor_device is not None:
                 logger.info(
-                    "[MultiGPU DisTorch V2] Mixed mode: weights stay in system RAM; %s holds activations",
+                    "[MultiGPU DisTorch V2] Mixed mode: %s holds activations and its allocated layers; other weights stay in system RAM",
                     mixed_donor_device,
                 )
 
@@ -1186,7 +1239,7 @@ def register_patched_safetensor_modelpatcher():
                     )
                     if mixed_donor_device is not None:
                         block_target_device = _mixed_weight_device(
-                            module_object, mixed_donor_device
+                            module_object, block_target_device, mixed_donor_device
                         )
                     current_module_device = None
                     try:
@@ -1228,7 +1281,7 @@ def register_patched_safetensor_modelpatcher():
                 )
                 if mixed_donor_device is not None:
                     block_target_device = _mixed_weight_device(
-                        module_object, mixed_donor_device
+                        module_object, block_target_device, mixed_donor_device
                     )
 
                 # Move directly to the assigned device. Staging donor weights on the
