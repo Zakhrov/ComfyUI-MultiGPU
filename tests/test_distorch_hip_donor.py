@@ -429,13 +429,15 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         model = DiffusionModel()
         transformer_options = {"patches": {}}
-        self.distorch.configure_mixed_execution(model, "cpu", "cpu")
+        schedule = types.SimpleNamespace(start_forward=lambda: calls.append("start_forward"))
+        self.distorch.configure_mixed_execution(model, "cpu", "cpu", schedule)
         output = model.forward(
             [torch.ones(2)], torch.zeros(1), transformer_options=transformer_options
         )
 
         self.assertTrue(torch.equal(output[0], torch.full((2,), 2.0)))
-        self.assertIn("optimized_attention_override", calls[0])
+        self.assertEqual(calls[0], "start_forward")
+        self.assertIn("optimized_attention_override", calls[1])
         self.assertNotIn("optimized_attention_override", transformer_options)
 
     def test_donor_prepared_linear_matches_full_linear(self):
@@ -537,27 +539,18 @@ class TestHipDonorGemmOffload(unittest.TestCase):
     def test_non_plain_lora_patches_stay_merged(self):
         lora_module = self.lora_adapter_module()
         up, down = torch.randn(5, 2), torch.randn(2, 3)
-        weight = torch.nn.Parameter(torch.randn(5, 3), requires_grad=False)
         dora = lora_module.LoRAAdapter((up, down, None, None, torch.ones(5), None))
-        weight.patches = [([(1.0, dora, 1.0, None, None)], "linear.weight")]
 
         with mock.patch.dict(sys.modules, {"comfy.weight_adapter.lora": lora_module}):
-            self.assertEqual(self.distorch._plain_lora_patches(weight), ())
-            weight.patches = [([(1.0, object(), 1.0, None, None)], "linear.weight")]
-            self.assertEqual(self.distorch._plain_lora_patches(weight), ())
-
-    def test_mixed_mode_keeps_donor_layers_resident(self):
-        donor = torch.device("cuda:1")
-        self.assertEqual(
-            self.distorch._mixed_weight_device(AllocationModule(), "cuda:1", donor), donor
-        )
-        for assigned in ("cuda:0", "cpu"):
+            self.assertEqual(self.distorch._plain_lora_patches([(1.0, dora, 1.0, None, None)]), ())
             self.assertEqual(
-                self.distorch._mixed_weight_device(AllocationModule(), assigned, donor), "cpu"
+                self.distorch._plain_lora_patches([(1.0, object(), 1.0, None, None)]), ()
             )
-        self.assertEqual(
-            self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), "cuda:0", donor), donor
-        )
+
+    def test_mixed_mode_leaves_donor_memory_to_activations(self):
+        donor = torch.device("cuda:1")
+        self.assertEqual(self.distorch._mixed_weight_device(AllocationModule(), donor), "cpu")
+        self.assertEqual(self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), donor), donor)
 
     def test_pinning_keeps_quantized_weight_metadata(self):
         class PackedTensor(torch.Tensor):
@@ -587,6 +580,173 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
     def test_mixed_mode_requires_standard_linear_tiling(self):
         self.assertFalse(self.distorch.configure_mixed_gemm(DonorModule(), "cuda:0", "cuda:1"))
+
+    def test_mixed_quantized_linear_runs_its_own_forward_in_token_chunks(self):
+        class QuantizedLinear(torch.nn.Linear):
+            layout_type = "TensorWiseINT8Layout"
+
+        module = QuantizedLinear(3, 5).requires_grad_(False)
+        chunks = []
+        original_forward = module.forward
+
+        def forward(value):
+            chunks.append(value.shape[0])
+            return original_forward(value)
+
+        module.forward = forward
+        input_tensor = torch.randn(2, 4, 3)
+        expected = module(input_tensor)
+        chunks.clear()
+
+        free_bytes = self.distorch._COMPUTE_GPU_RESERVE_BYTES + 72 + 3 * 2 * (3 + 5) * 4 * 2
+        with (
+            mock.patch.object(self.distorch, "_PIPELINE_CHUNKS", 4),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: free_bytes, create=True),
+            mock.patch.object(self.distorch.mm, "module_size", lambda _: 72, create=True),
+        ):
+            self.assertTrue(self.distorch.configure_mixed_gemm(module, "cpu", "cpu"))
+            output = module.forward(input_tensor)
+
+        # Three chunks of 2 tokens fit what the weight (72 bytes) leaves, and 8 tokens
+        # already make _PIPELINE_CHUNKS chunks at that size.
+        self.assertEqual(chunks, [2, 2, 2, 2])
+        self.assertTrue(torch.allclose(output, expected))
+
+    def test_mixed_int8_linear_runs_stored_weight_and_keeps_lora_low_rank(self):
+        module = torch.nn.Linear(3, 5).requires_grad_(False)
+        up, down = torch.randn(5, 2), torch.randn(2, 3)
+        self.assertTrue(self.distorch.configure_mixed_gemm(module, "cpu", "cpu", int8=True))
+        module._mgpu_int8_weight = module.weight + 1
+        module._mgpu_int8_bias = module.bias
+        module._mgpu_int8_lora = [(down, up, 0.5)]
+        input_tensor = torch.randn(2, 3, 3)
+        free_bytes = self.distorch._COMPUTE_GPU_RESERVE_BYTES + 2 * (3 + 5 + 2) * 4 * 2
+
+        with mock.patch.object(
+            self.distorch.mm, "get_free_memory", lambda *_: free_bytes, create=True
+        ):
+            output = module(input_tensor)
+
+        expected = functional.linear(
+            input_tensor, module.weight + 1 + 0.5 * (up @ down), module.bias
+        )
+        self.assertTrue(torch.allclose(output, expected, atol=1e-5))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")
+    def test_mixed_linears_learn_their_order_and_stage_the_next_weight(self):
+        device = torch.device("cuda:0")
+        schedule = self.distorch._MixedSchedule(device, device)
+        first, second = (torch.nn.Linear(256, 256).requires_grad_(False) for _ in range(2))
+        for module in (first, second):
+            self.assertTrue(
+                self.distorch.configure_mixed_gemm(module, device, device, schedule=schedule)
+            )
+        x = torch.randn(64, 256, device=device)
+        expected = x
+        for module in (first, second):
+            expected = functional.linear(expected, module.weight.to(device), module.bias.to(device))
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30, create=True):
+            for _ in range(2):
+                schedule.start_forward()
+                output = second(first(x))
+                self.assertTrue(torch.allclose(output, expected, atol=1e-4))
+                self.assertIs(schedule.following[first], second)
+            schedule.start_forward()
+            first(x)
+            self.assertIsNotNone(second._mgpu_staged)
+            schedule.start_forward()
+
+        self.assertIsNone(second._mgpu_staged)
+        self.assertEqual(list(first.children()), [])
+
+    def test_mixed_int8_needs_convrot_group_aligned_features(self):
+        self.assertTrue(self.distorch._is_mixed_int8_linear(torch.nn.Linear(512, 4)))
+        self.assertFalse(self.distorch._is_mixed_int8_linear(torch.nn.Linear(96, 4)))
+        quantized = torch.nn.Linear(512, 4)
+        quantized.layout_type = "TensorWiseINT8Layout"
+        self.assertFalse(self.distorch._is_mixed_int8_linear(quantized))
+
+    def int8_modules(self, merged):
+        quant_ops = types.ModuleType("comfy.quant_ops")
+        lora = types.ModuleType("comfy.lora")
+        quantized = []
+
+        class QuantizedTensor:
+            @staticmethod
+            def from_float(tensor, layout, **kwargs):
+                quantized.append((layout, kwargs))
+                return tensor.clone()
+
+        def calculate_weight(patches, weight, key):
+            merged.append(key)
+            return weight + 1
+
+        quant_ops.QuantizedTensor = QuantizedTensor
+        lora.calculate_weight = calculate_weight
+        return {
+            "comfy.quant_ops": quant_ops,
+            "comfy.lora": lora,
+            "comfy.weight_adapter.lora": self.lora_adapter_module(),
+        }, quantized
+
+    def test_prepares_int8_weight_once_per_patch_set(self):
+        merged = []
+        modules, quantized = self.int8_modules(merged)
+        module = torch.nn.Linear(3, 5).requires_grad_(False)
+        up, down = torch.randn(5, 2), torch.randn(2, 3)
+        adapter = modules["comfy.weight_adapter.lora"].LoRAAdapter((up, down, None, None, None, None))
+        patches = {"linear.weight": [(0.5, adapter, 1.0, None, None)]}
+
+        with mock.patch.dict(sys.modules, modules):
+            prepare = self.distorch._prepare_mixed_int8_weight
+            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-1")
+            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-1")
+            self.assertEqual(len(quantized), 1)
+            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-2")
+
+        self.assertEqual(
+            quantized,
+            2 * [("TensorWiseINT8Layout", {"is_weight": True, "per_channel": True, "convrot": True})],
+        )
+        # The plain LoRA stays low rank; the stored weight is the unpatched original.
+        self.assertEqual(merged, [])
+        self.assertTrue(torch.equal(module._mgpu_int8_weight, module.weight))
+        self.assertTrue(torch.equal(module._mgpu_int8_bias, module.bias))
+        (lora_down, lora_up, scale), = module._mgpu_int8_lora
+        self.assertIs(lora_down, down)
+        self.assertEqual(scale, 0.5)
+        self.assertNotIn("_mgpu_int8_weight", module.state_dict())
+
+    def test_merges_non_plain_patches_into_int8_weight(self):
+        merged = []
+        modules, _ = self.int8_modules(merged)
+        module = torch.nn.Linear(3, 5).requires_grad_(False)
+        patches = {
+            "linear.weight": [(1.0, object(), 1.0, None, None)],
+            "linear.bias": [(1.0, object(), 1.0, None, None)],
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            self.distorch._prepare_mixed_int8_weight(
+                module, "linear", patches, torch.float32, "cpu", "uuid"
+            )
+
+        self.assertEqual(merged, ["linear.weight", "linear.bias"])
+        self.assertTrue(torch.equal(module._mgpu_int8_weight, module.weight + 1))
+        self.assertTrue(torch.equal(module._mgpu_int8_bias, module.bias + 1))
+        self.assertEqual(module._mgpu_int8_lora, ())
+
+    def test_accepts_comfy_mixed_precision_linear_for_compute_tiling(self):
+        class MixedPrecisionLinear(torch.nn.Module):
+            quant_format = "int8_tensorwise"
+
+            def __init__(self):
+                super().__init__()
+                self.in_features, self.out_features = 3, 5
+                self.weight = torch.nn.Parameter(torch.empty(5, 3), requires_grad=False)
+
+        self.assertTrue(self.distorch._can_tile_linear_on_compute(MixedPrecisionLinear()))
 
     def test_rejects_packed_linear_weight_for_compute_tiling(self):
         module = torch.nn.Linear(1, 1, bias=False)
@@ -641,6 +801,47 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         ):
             assignments = self.distorch.analyze_safetensor_loading(
                 patcher, "True#cuda:0;24.0;cuda:1"
+            )
+
+        self.assertEqual(assignments["block_assignments"]["linear"], "cuda:1")
+
+    def test_clip_keeps_only_unquantized_embeddings_on_compute(self):
+        embed = torch.nn.Embedding(4, 2)
+        packed = torch.nn.Embedding(4, 2)
+        packed.weight.tensor_type = "Q8_0"
+        items = ((8, "embed_tokens", embed, {}), (8, "packed.embed_tokens", packed, {}))
+
+        _, distributable, assignments, head_memory = self.distorch._extract_clip_head_blocks(
+            items, "cuda:0"
+        )
+
+        self.assertEqual(assignments, {"embed_tokens": "cuda:0"})
+        self.assertEqual([name for _, name, _, _ in distributable], ["packed.embed_tokens"])
+        self.assertEqual(head_memory, 8)
+
+    def test_virtual_vram_sizes_model_by_stored_bytes(self):
+        # A quantized weight reports its logical dtype: 4 MiB as float32, 1 MiB stored as int8.
+        module = AllocationModule()
+        module.weight = torch.empty(1024, 1024)
+        patcher = AllocationPatcher(module)
+        patcher._load_list = lambda: ((1024 * 1024, "linear", module, {}),)
+        mebibyte = 1024**2
+
+        with (
+            mock.patch.object(
+                self.distorch, "get_device_list", return_value=["cuda:0", "cuda:1", "cpu"]
+            ),
+            mock.patch.object(
+                self.distorch.mm,
+                "get_total_memory",
+                side_effect=lambda device: {"cuda:0": 2 * mebibyte, "cuda:1": 32 * mebibyte}.get(
+                    str(device), 64 * mebibyte
+                ),
+                create=True,
+            ),
+        ):
+            assignments = self.distorch.analyze_safetensor_loading(
+                patcher, "#cuda:0;0.001;cuda:1"
             )
 
         self.assertEqual(assignments["block_assignments"]["linear"], "cuda:1")

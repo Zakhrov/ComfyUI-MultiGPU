@@ -369,10 +369,10 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
                 ),
                 "unet_donor_device": (devices, {"default": "cpu"}),
                 "donor_gemm_execution_mode": (
-                    ["disabled", "mixed", "all"],
+                    ["disabled", "mixed", "mixed_int8", "all"],
                     {
                         "default": "disabled",
-                        "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; all runs every eligible GEMM on the donor.",
+                        "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; mixed_int8 also requantizes prepared weights to int8 for Comfy Kitchen int8 GEMMs; all runs every eligible GEMM on the donor.",
                     },
                 ),
                 "clip_compute_device": (devices, {"default": "cpu"}),

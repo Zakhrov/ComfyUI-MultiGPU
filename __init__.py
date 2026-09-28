@@ -750,6 +750,7 @@ from .nodes import (
     DualCLIPLoaderGGUF,
     TripleCLIPLoaderGGUF,
     QuadrupleCLIPLoaderGGUF,
+    ClipProjLoader,
     LTXVLoader,
     Florence2ModelLoader,
     DownloadAndLoadFlorence2Model,
@@ -1041,6 +1042,14 @@ register_and_count(
     ["ComfyUI-GGUF", "ComfyUI-GGUF-Loader", "comfyui-gguf-loader", "comfyui-gguf"],
     gguf_nodes,
 )
+
+# Text Encoder + ClipProj Loader exists only in ChrisColeTech's ComfyUI-GGUF-Loader.
+clipproj_nodes = {
+    "CCTechClipProjLoaderDisTorch2MultiGPU": override_class_with_distorch_safetensor_v2_clip(
+        ClipProjLoader
+    ),
+}
+register_and_count(["ComfyUI-GGUF-Loader", "comfyui-gguf-loader"], clipproj_nodes)
 
 pulid_nodes = {
     "PulidModelLoaderMultiGPU": override_class(PulidModelLoader),

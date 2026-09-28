@@ -94,6 +94,22 @@ class CLIPLoaderGGUF:
         original_loader = NODE_CLASS_MAPPINGS["CLIPLoaderGGUF"]()
         return original_loader.load_clip(clip_name, type)
 
+class ClipProjLoader:
+    """ComfyUI-GGUF-Loader's Text Encoder + ClipProj Loader (CCTechClipProjLoader)."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return NODE_CLASS_MAPPINGS["CCTechClipProjLoader"].INPUT_TYPES()
+
+    RETURN_TYPES = ("CLIP",)
+    FUNCTION = "load_clip_projected"
+    CATEGORY = "bootleg"
+    TITLE = "Text Encoder + ClipProj Loader"
+
+    def load_clip_projected(self, clip_name, type, projection, device=None):
+        original_loader = NODE_CLASS_MAPPINGS["CCTechClipProjLoader"]()
+        return original_loader.load_clip_projected(clip_name, type, projection)
+
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
     def INPUT_TYPES(s):
