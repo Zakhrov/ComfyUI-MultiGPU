@@ -1,66 +1,98 @@
-# ComfyUI-MultiGPU v2: Universal .safetensors and GGUF Multi-GPU Distribution with DisTorch - Now with ROCm Enhancments
+# ComfyUI-MultiGPU (AMD ROCm fork)
 
-## The Core of ComfyUI-MultiGPU v2
+A fork of [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) that adds donor-GPU GEMM execution for multi-GPU AMD ROCm systems on top of the upstream DisTorch2 model distribution.
 
-1. **Universal .safetensors Support**: Native DisTorch2 distribution for all `.safetensors` models.
-2. **Up to 10% Faster GGUF Inference versus DisTorch1**: The new DisTorch2 logic provides potential speedups for GGUF models versus the DisTorch V1 method.
-3. **Bespoke WanVideoWrapper Integration**: Tightly integrated, stable support for WanVideoWrapper with eight bespoke MultiGPU nodes.
-4. **New Model-Driven Allocation Options**: Two new inutuitive model-driven Expert Modes to facilitate exact placement on all available devices - 'bytes' and 'ratio'
+> [!WARNING]
+> **AMD ROCm only.** The changes in this fork are developed and tested exclusively on AMD GPUs with ROCm (HIP builds of PyTorch). They are **not** tested on, and should be assumed **not to work** on, NVIDIA CUDA, Intel XPU, Apple MPS, DirectML or any other torch backend. If you are not on ROCm, use [upstream ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) instead.
 
-What is DisTorch? Standing for "distributed torch", the DisTorch nodes in this custom_node provide a way of moving the static parts of your main image generation model known as the `UNet` off your main compute card to somewhere slower, but one that is not taking up space that could be better used for longer videos or more concurrent images. By selecting one or more donor devices - main CPU DRAM or another cuda/xps device's VRAM - you can select how much of the model is loaded on that device instead of your main `compute` card. Just set how much VRAM you want to free up, and DisTorch handles the rest.
+> [!CAUTION]
+> **Requires a custom, unofficial Comfy Kitchen HIP backend.** The donor GEMM modes depend on the `hip-bringup` branch of a Comfy Kitchen fork: [Zakhrov/comfy-kitchen@hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup). This backend is experimental, is not part of official Comfy Kitchen releases, and is not supported by the Comfy Kitchen or ComfyUI maintainers. Expect breakage when ComfyUI or Comfy Kitchen update. Do not report problems caused by it to those projects.
 
-- **Two Modes**:
-  - **Normal Mode**: The standard `virtual_vram_gb` slider continues to let you select one donor device (like your system's RAM) to offload to. The more virtual VRAM you add, the more of the model is pushed to the donor device. Simple and effective.
-  - **Expert Mode**: For connoisseurs of performance, with two Expert Modes `byte` and `ratio` that allow you to specify exactly how the *model itself* is split across all your available devices as well as the legacy `fraction` method for *your devices* to have exact allocations. These modes are all accomplished via a single, flexible text string:
-    - **Bytes (Recommended)**: The most direct way to slice up your model. Inspired by Huggingface's `device_map`, you can specify the exact number of gigabytes or megabytes for each device. The wildcard `*` assigns the remainder of the model to a device, making it easy to offload. (The CPU acts as the default wildcard if none are specified.)
-      - **Example**: `cuda:0,2.5gb;cpu,*` will load the first 2.50GB of the model onto `cuda:0` and the rest onto the `cpu`.
-      - **Example**: `cuda:0,500mb;cuda:1,3.0g;cpu,5gb*` will put 0.50GB on `cuda:0`, 3.00GB on `cuda:1`, and 5.00GB (or the remainder) on `cpu`.
-    - **Ratio**: Love the simplicity of `llama.cpp`'s `tensor_split`? This mode is for you. Specify a ratio to distribute the model across devices.
-      - **Example**: `cuda:0,25%;cpu,75%` will split the model in a 1:3 ratio, loading 25% onto `cuda:0` and 75% onto the `cpu`.
-      - **Example**: `cuda:0,8%;cuda:1,8%;cpu,4%` uses an 8:8:4 ratio, putting 40% of the model on `cuda:0`, 40% on `cuda:1`, and 20% on `cpu`.
-    - **Fraction**: The original DisTorch expert mode. This mode splits the model based on the fraction of each device's *total VRAM* to be used.
-      - **Example**: `cuda:0,0.1;cpu,0.5` will use 10% of `cuda:0`'s VRAM and 50% of the `cpu`'s RAM to hold the model.
-      - **Example**: `cuda:0,0.0207;cuda:1,0.1273;cpu,0.0808` will use 2.1% of `cuda:0`'s VRAM, 12.7% of `cuda:1`'s VRAM, and 8.1% of the `cpu`'s RAM to hold the model.
+## What's different from upstream
 
-### AMD ROCm Software-GEMM MultiGPU Enhancements
+| Area | Change |
+| --- | --- |
+| Donor GEMM execution | New `donor_gemm_execution_mode` input (`disabled`, `mixed`, `mixed_int8`, `all`) on DisTorch2 loaders and the DisTorch2 checkpoint loader. Runs linear, conv and attention work split across a compute GPU and a donor GPU instead of copying donor weights back for every op. See [ROCm donor GEMM execution](#rocm-donor-gemm-execution). |
+| HIP DLPack guard | The Comfy Kitchen DLPack device guard and CPU-staging fallback now also wrap `comfy_kitchen.backends.hip`, not only the CUDA backend. |
+| P2P detection | The peer-access registry calls `hipDeviceCanAccessPeer` (`libamdhip64.so`) on ROCm builds instead of `cudaDeviceCanAccessPeer`, and falls back to CPU staging if the runtime library can't be loaded. |
+| VAE | `VAELoaderDisTorch2MultiGPU` supports `mixed` mode for image and video VAE encode/decode, including temporal caches such as Wan's. |
+| GGUF text encoder | New `CCTechClipProjLoaderDisTorch2MultiGPU` for [ComfyUI-GGUF-Loader](https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader)'s Text Encoder + ClipProj Loader. Layers the allocation leaves on `cpu` stay memory-mapped on disk and are streamed one layer at a time. |
+| WanVideoWrapper | The WanVideo model loader falls back to the offload-aware default RMSNorm when PyTorch RMSNorm is selected, since the native one is incompatible with WanVideo VRAM management. |
+| Tests | `tests/test_distorch_hip_donor.py` covers the donor GEMM paths. |
 
-With a Comfy Kitchen build that includes HIP software-tiled GEMM support found here: [https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup), DisTorch can execute eligible donor-assigned linear layers on a second AMD GPU instead of copying their weights back to the compute GPU for every operation. The layer input is sent to the donor, its GEMM runs there, and the result returns to the compute GPU.
+With `donor_gemm_execution_mode` left at `disabled` (the default), DisTorch2 behaves like upstream. Even so, the rest of this fork has only been exercised on ROCm.
 
-This is enabled automatically only when both the compute and donor GPUs use the HIP software-GEMM path: Vega/GCN5 (`gfx900`, `gfx906`, `gfx90c`), RDNA1 (`gfx1010`-`gfx1012`), or RDNA2 (`gfx1030`-`gfx1036`). Native-WMMA GPUs (RDNA 3 and later / CDNA) retain the normal placement behavior.
+## About DisTorch2
 
-For VRAM-constrained systems, use Expert Mode to place a meaningful group of model layers on the donor, for example `cuda:0,2gb;cuda:1,4gb;cpu,*`. This keeps those weights and their temporary GEMM intermediates off `cuda:0`, which can make room for larger latents, longer video contexts, or a model that otherwise would not fit on the primary GPU. CPU-assigned HIP weights are also pinned so the HIP backend can use its mapped-host weight path.
+DisTorch ("distributed torch") moves the static parts of your main model off your compute GPU to a donor device — system RAM or another GPU's VRAM — so the compute GPU's VRAM is free for latents, longer videos or bigger batches. Pick one or more donor devices and how much of the model to put on each, and DisTorch handles the rest. It works with all `.safetensors` and GGUF models.
 
-Donor execution trades transfer bandwidth and latency for lower peak VRAM on the compute GPU. DisTorch2 nodes provide a `donor_gemm_execution_mode` selector:
+- **Normal mode**: the `virtual_vram_gb` slider picks how much of the model moves to a single donor device (such as system RAM).
+- **Expert mode**: an allocation string that sets exactly how the model is split across devices:
+  - **Bytes (recommended)**: gigabytes or megabytes per device, like Hugging Face's `device_map`. `*` assigns the remainder (the CPU is the default wildcard).
+    - `cuda:0,2.5gb;cpu,*` — first 2.5 GB on `cuda:0`, the rest on `cpu`.
+    - `cuda:0,500mb;cuda:1,3.0g;cpu,5gb*` — 0.5 GB on `cuda:0`, 3 GB on `cuda:1`, the remainder on `cpu`.
+  - **Ratio**: like `llama.cpp`'s `tensor_split`.
+    - `cuda:0,25%;cpu,75%` — a 1:3 split.
+    - `cuda:0,8%;cuda:1,8%;cpu,4%` — 40% / 40% / 20%.
+  - **Fraction**: the original DisTorch mode, a fraction of each device's *total* memory.
+    - `cuda:0,0.1;cpu,0.5` — 10% of `cuda:0`'s VRAM and 50% of system RAM.
 
-- **mixed** (specifically for AMD+AMD laptops/systems, tested on a Dell G5 15 SE that has an RX5600M 6gb, and a Ryzen Vega APU): the donor GPU runs the diffusion model. Activations, norms, modulation, rope, residuals, dequantization and weight patches stay on the donor. Linear layers send their GEMM work to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied straight back into a buffer on the donor. Linears and attention are split into at least 8 chunks whose copies to and from the compute GPU run on a side stream, overlapping the neighbouring chunks' compute; at most two chunks are in flight, so the compute GPU only holds a few chunk buffers. Each linear also learns which linear runs next and, once its first chunk is queued, prepares that one's weight on a separate donor stream and copies it to the compute GPU, so weight preparation overlaps the current GEMM. Nothing is staged across forwards. Attention runs on the compute GPU in chunks of whole heads over the full sequence; if a chunk runs out of memory it is halved and the smaller size is kept until the model is reloaded, and attention falls back to the donor only when a single head does not fit. The compute GPU never holds a full activation, so high-resolution images and long videos are limited by donor memory (for example an APU/iGPU using shared system RAM) rather than compute-GPU VRAM. The first GPU donor in the allocation is used, and the allocation only picks it: the donor's memory holds activations, not weights. Weights stay where they were loaded (a GGUF stays memory-mapped on disk, safetensors models in RAM) and the donor prepares them one layer at a time. The compute GPU holds no weights, only GEMM tiles and attention chunks. Only `all` mode pins CPU weights, since only donor GEMMs read host memory directly. ComfyUI's quantized safetensors layers (int8, fp8) send their packed weight to the compute GPU and run their own quantized matmul there, such as Comfy Kitchen's int8 GEMM. Plain LoRAs on GGUF models run as two thin GEMMs on the compute GPU instead of being merged into the dequantized weight on the donor for every call; DoRA, LoCon and other patch types are still merged. Conv2d and Conv3d layers are handled the same way: the donor keeps the activation and sends the compute GPU only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). With `VAELoaderDisTorch2MultiGPU`, mixed mode runs image and video VAE encode and decode on the donor, including temporal caches such as Wan's, and their conv and linear GEMMs run on the compute GPU. VAE mixed mode does not require Comfy Kitchen attention, because VAE attention stays on the donor. Grouped convs still run on the donor.
-- **mixed_int8** (requires the comfy_kitchen attention): mixed mode, but while the model loads, each linear (GGUF Q4/Q5/Q8 and other types, fp16/bf16 safetensors) is converted once on the donor to the int8 ConvRot layout of ComfyUI's int8_convrot checkpoints and kept in system RAM; the compute GPU reads it from RAM, as fast as from the donor since PCIe limits both, and runs it with Comfy Kitchen's int8 GEMM. The donor keeps only activations, so it has more room for them than in mixed. The originals are not copied: a GGUF stays memory-mapped on disk, while safetensors models are already held in RAM by ComfyUI. The int8 weights take about 1 byte per weight of system RAM (roughly twice a Q4 model) for as long as the model is loaded or cached. Reloading with the same LoRAs reuses them; changing LoRAs converts again. Requantizing a GGUF weight adds a second rounding on top of its own quantization. Plain LoRAs, linears whose input features are not a multiple of 256, and VAEs run at full precision, as in mixed.
-- **all**: every eligible donor-resident linear GEMM executes entirely on the donor. Use this when the donor can complete even large GEMMs quickly enough that avoiding transfers is preferable. (Basically a crude version of SLI/Crossfire for the AI model inferencing, should work well with a 50/50 split on identical or similar GPUs like 2x 5700XTs or 2x Radeon VIIs)
+On ROCm, PyTorch still names AMD GPUs `cuda:N`, so these strings are unchanged.
 
-Both modes require compute and donor GPUs that use the HIP software-GEMM path. Look for `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1` in the ComfyUI log to confirm that the donor path was invoked.
+On ComfyUI builds with DynamicVRAM/comfy-aimdo enabled, MultiGPU keeps DynamicVRAM on devices comfy-aimdo initialized and falls back to legacy model patching for other MultiGPU devices.
 
-## 🎯 Key Benefits
+## ROCm donor GEMM execution
 
-- Free up GPU VRAM instantly without complex settings
-- Run larger models by offloading layers to other system RAM
-- Use all your main GPU's VRAM for actual `compute` / latent processing, or fill it up just enough to suit your needs and the remaining with quick-access model blocks.
-- Seamlessly distribute .safetensors and GGUF layers across multiple GPUs if available
-- Allows **you** to easily shift from ***on-device speed*** to ***open-device latent space capability*** with a simple one-number change
+With the [Comfy Kitchen HIP backend](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup) installed, DisTorch2 can run donor-assigned layers across two AMD GPUs instead of copying their weights to the compute GPU for every op.
 
-## 🚀 Compatibility
+### Supported GPUs
 
-Works with all .safetensors and GGUF-quantized models.
+Both the compute and the donor GPU must use the HIP software-GEMM path:
 
-On current ComfyUI builds with DynamicVRAM/comfy-aimdo enabled, MultiGPU keeps DynamicVRAM active on CUDA devices that comfy-aimdo has initialized and falls back to legacy model patching for off-grid MultiGPU CUDA devices. This preserves MultiGPU placement for devices such as `cuda:1` even when comfy-aimdo only initialized the primary device.
+- Vega / GCN5: `gfx900`, `gfx906`, `gfx90c`
+- RDNA1: `gfx1010`–`gfx1012`
+- RDNA2: `gfx1030`–`gfx1036`
 
-⚙️ Expert users: Like .gguf or exl2/3 LLM loaders, use the expert_mode_alloaction for exact allocations of model shards on as many devices as your setup has!
+RDNA3 and later, and CDNA (native WMMA) GPUs keep normal DisTorch2 placement. To confirm the donor path is in use, check the ComfyUI log:
+
+- `mixed` / `mixed_int8`: `[MultiGPU DisTorch V2] Mixed execution: activations on cuda:1, GEMMs and attention on cuda:0`. If a requirement isn't met, `Mixed mode disabled: <reasons>` is logged and the model loads normally.
+- `all`: `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1`.
+
+Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM on the compute GPU. Use Expert mode to put a meaningful group of layers on the donor, for example `cuda:0,2gb;cuda:1,4gb;cpu,*`.
+
+### Modes
+
+- **`disabled`** (default): standard ComfyUI/DisTorch2 execution.
+
+- **`mixed`**: the donor GPU runs the model and the compute GPU does only the heavy math. Built for AMD+AMD laptops and systems; tested on a Dell G5 15 SE (RX 5600M 6 GB + Ryzen Vega APU).
+  - Activations, norms, modulation, RoPE, residuals, dequantization and weight patches stay on the donor. The donor's memory holds activations, so high-resolution images and long videos are limited by donor memory (for example an APU using shared system RAM), not compute-GPU VRAM.
+  - Linear GEMMs are sent to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied back to the donor. Work is split into at least 8 chunks, and the copies run on a side stream overlapping neighbouring chunks' compute. At most two chunks are in flight.
+  - Each linear prepares the next linear's weight on a separate donor stream while the current GEMM runs. Nothing is staged across forwards.
+  - Attention runs on the compute GPU in chunks of whole heads. On OOM the chunk is halved and the smaller size is kept until the model reloads; attention falls back to the donor only if a single head doesn't fit. Requires Comfy Kitchen attention.
+  - Weights stay where they were loaded (GGUF memory-mapped on disk, safetensors in RAM) and are prepared on the donor one layer at a time. The compute GPU holds no weights, only GEMM tiles and attention chunks. The allocation only selects the donor (the first GPU donor listed).
+  - ComfyUI quantized safetensors layers (int8, fp8) send their packed weight to the compute GPU and run their own quantized matmul there.
+  - Plain LoRAs on GGUF models run as two thin GEMMs on the compute GPU instead of being merged into the dequantized weight on every call. DoRA, LoCon and other patch types are still merged.
+  - Conv2d and Conv3d: the compute GPU receives only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). Grouped convs run on the donor.
+  - With `VAELoaderDisTorch2MultiGPU`, image and video VAE encode/decode run on the donor with their conv and linear GEMMs on the compute GPU. VAE attention stays on the donor, so Comfy Kitchen attention isn't required for VAEs.
+
+- **`mixed_int8`**: `mixed`, plus a one-time conversion at load of every linear (GGUF Q4/Q5/Q8 and others, fp16/bf16 safetensors) to ComfyUI's int8 ConvRot layout, run with Comfy Kitchen's int8 GEMM. Requires Comfy Kitchen attention.
+  - The int8 weights live in system RAM (about 1 byte per weight, roughly twice a Q4 model) while the model is loaded or cached. The donor keeps only activations, so it has more room than in `mixed`.
+  - Reloading with the same LoRAs reuses the converted weights; changing LoRAs converts again.
+  - Requantizing a GGUF weight adds a second rounding on top of its own quantization.
+  - Plain LoRAs, linears whose input features aren't a multiple of 256, and VAEs run at full precision as in `mixed`.
+
+- **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins CPU weights, since only donor GEMMs read host memory directly.
 
 ## Installation
 
-Installation via [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager) is preferred. Simply search for `ComfyUI-MultiGPU` in the list of nodes and follow installation instructions.
+ComfyUI-Manager installs upstream, not this fork. Install manually:
 
-## Manual Installation
-
-Clone [this repository](https://github.com/pollockjj/ComfyUI-MultiGPU) inside `ComfyUI/custom_nodes/`.
+1. Clone this repository into `ComfyUI/custom_nodes/`:
+   ```bash
+   git clone https://github.com/Zakhrov/ComfyUI-MultiGPU
+   ```
+2. For donor GEMM modes, install the Comfy Kitchen HIP backend from [Zakhrov/comfy-kitchen@hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup) into the same Python environment as ComfyUI, replacing any official `comfy-kitchen` package.
+3. Run ComfyUI with a ROCm build of PyTorch.
 
 ## Nodes
 
@@ -141,7 +173,7 @@ Detailed technical documentation is available for all **automatically-detected c
 
 ## Example workflows
 
-All workflows have been tested on a 2x 3090 + 1060ti linux setup, a 4070 win 11 setup, and a 3090/1070ti linux setup.
+These workflows come from upstream, where they were tested on NVIDIA setups (2x 3090 + 1060 Ti Linux, 4070 Windows 11, 3090 + 1070 Ti Linux). They have not all been re-tested on ROCm in this fork.
 
 ### DisTorch2
 
@@ -289,10 +321,11 @@ All workflows have been tested on a 2x 3090 + 1060ti linux setup, a 4070 win 11 
 
 ## Support
 
-Maintenance has ended. Until the repository is archived on 30 September 2026, fork maintainers and users can coordinate in the [pinned issue](https://github.com/pollockjj/ComfyUI-MultiGPU/issues/223). Bug reports will not be acted on here. After archiving, the repository remains available to read; future compatibility with ComfyUI, ComfyUI-Manager or other custom nodes is unsupported.
+This is a personal fork, maintained on a best-effort basis and tested only on AMD ROCm. Report issues with the ROCm changes at [Zakhrov/ComfyUI-MultiGPU](https://github.com/Zakhrov/ComfyUI-MultiGPU/issues), not upstream. Upstream maintenance has ended and the upstream repository is being archived on 30 September 2026; see its [pinned issue](https://github.com/pollockjj/ComfyUI-MultiGPU/issues/223) for fork coordination.
 
 ## Credits
 
-Maintained by [pollockjj](https://github.com/pollockjj) until September 2026.
+ROCm donor GEMM changes by [Aaron Zakhrov](https://github.com/Zakhrov).
+Upstream maintained by [pollockjj](https://github.com/pollockjj) until September 2026.
 Originally created by [Alexander Dzhoganov](https://github.com/AlexanderDzhoganov).
 With deepest thanks to [City96](https://v100s.net/).
