@@ -441,7 +441,7 @@ def _run_tiled_conv_on_compute(
     return output
 
 
-def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan, mask=None, **kwargs):
+def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_device, plan, **kwargs):
     """Run attention on the compute GPU in head chunks over the whole sequence.
 
     Heads are independent, so a chunk copies only its own heads' Q, K and V.
@@ -455,7 +455,7 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
     """
     key = (q.shape, k.shape)
     if mask is not None or plan.get(key, True) is None:
-        return func(q, k, v, heads, *args, mask=mask, **kwargs)
+        return func(q, k, v, heads, mask, *args, **kwargs)
 
     skip_reshape = kwargs.get("skip_reshape", False)
     skip_output_reshape = kwargs.get("skip_output_reshape", False)
@@ -502,7 +502,7 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
     def run(inputs):
         q_chunk, k_chunk, v_chunk = inputs
         count = q_chunk.shape[1] if skip_reshape else q_chunk.shape[-1] // head_dim
-        return func(q_chunk, k_chunk, v_chunk, count, *args, mask=None, **kwargs)
+        return func(q_chunk, k_chunk, v_chunk, count, None, *args, **kwargs)
 
     def store(part, result):
         nonlocal output
@@ -543,7 +543,7 @@ def _run_attention_on_compute(func, q, k, v, heads, *args, compute_device, plan,
                 "[MultiGPU DisTorch V2] Attention does not fit on %s; running it on the donor",
                 compute_device,
             )
-            return func(q, k, v, heads, *args, mask=None, **kwargs)
+            return func(q, k, v, heads, None, *args, **kwargs)
 
 
 def _materialize_linear_on_donor(module, dtype, donor_device):
@@ -1197,7 +1197,8 @@ def configure_hip_donor_gemm_offload(
             target_device = module._mgpu_donor_execution_device
             donor_args = _move_tensors(args, target_device)
             donor_kwargs = _move_tensors(kwargs, target_device)
-            output = module._mgpu_original_forward(*donor_args, **donor_kwargs)
+            with _current_device(target_device):
+                output = module._mgpu_original_forward(*donor_args, **donor_kwargs)
             output = _move_tensors(output, module._mgpu_compute_device)
             module._mgpu_donor_gemm_calls += 1
             if module._mgpu_donor_gemm_calls == 1:

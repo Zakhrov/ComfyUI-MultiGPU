@@ -13,8 +13,6 @@ A fork of [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-Mult
 | Area | Change |
 | --- | --- |
 | Donor GEMM execution | New `donor_gemm_execution_mode` input (`disabled`, `mixed`, `mixed_int8`, `all`) on DisTorch2 loaders and the DisTorch2 checkpoint loader. Runs linear, conv and attention work split across a compute GPU and a donor GPU instead of copying donor weights back for every op. See [ROCm donor GEMM execution](#rocm-donor-gemm-execution). |
-| HIP DLPack guard | The Comfy Kitchen DLPack device guard and CPU-staging fallback now also wrap `comfy_kitchen.backends.hip`, not only the CUDA backend. |
-| P2P detection | The peer-access registry calls `hipDeviceCanAccessPeer` (`libamdhip64.so`) on ROCm builds instead of `cudaDeviceCanAccessPeer`, and falls back to CPU staging if the runtime library can't be loaded. |
 | VAE | `VAELoaderDisTorch2MultiGPU` supports `mixed` mode for image and video VAE encode/decode, including temporal caches such as Wan's. |
 | GGUF text encoder | New `CCTechClipProjLoaderDisTorch2MultiGPU` for [ComfyUI-GGUF-Loader](https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader)'s Text Encoder + ClipProj Loader. Layers the allocation leaves on `cpu` stay memory-mapped on disk and are streamed one layer at a time. |
 | WanVideoWrapper | The WanVideo model loader falls back to the offload-aware default RMSNorm when PyTorch RMSNorm is selected, since the native one is incompatible with WanVideo VRAM management. |
@@ -82,6 +80,27 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
   - Plain LoRAs, linears whose input features aren't a multiple of 256, and VAEs run at full precision as in `mixed`.
 
 - **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins CPU weights, since only donor GEMMs read host memory directly.
+
+### Benchmarks
+
+Z-Image Turbo, 1024×1024, 8 steps, `res_multistep`/`simple`, CFG 1, on a Dell G5 15 SE: RX 5600M 6 GB (`gfx1010`, `cuda:0`, compute) + Ryzen Vega APU (`gfx90c`, `cuda:1`, donor, shared system RAM). PyTorch 2.12 ROCm nightly (HIP 7.17), `--cuda-malloc --disable-dynamic-vram --use-ck-attention`. Runs use `UnetLoaderGGUFDisTorch2MultiGPU` (GGUF) or `UNETLoaderDisTorch2MultiGPU` (int8_convrot) with `virtual_vram_gb` 4.0. The `disabled` baseline uses the default `cpu` donor and the other modes use `cuda:1`. The text encoder and VAE run on the CPU and are not counted.
+
+Time is the KSampler node's wall time (including per-run weight loading), averaged over 2–3 runs. VRAM is the peak from sysfs during sampling. The APU's 512 MB VRAM carve-out is always full, so its usage is shown as GTT (system RAM mapped to the GPU), which includes about 0.5–0.8 GB of desktop usage at idle. The first `disabled` GGUF run, which also loaded the CPU text encoder, peaked at 4.89 GB GTT and is left out of that column. All modes produced matching images.
+
+| Format | Mode | Time | vs. `disabled` | RX 5600M peak VRAM | APU peak GTT |
+| --- | --- | --- | --- | --- | --- |
+| GGUF Q8_0 (7.2 GB) | `disabled` | 255 s | baseline | 4.98 GB | 0.84 GB |
+| | `mixed` | 330 s | 0.77× speed | 0.73 GB (−85%) | 1.81 GB |
+| | `mixed_int8` | 220 s | **1.16× speed** | **0.62 GB (−88%)** | 1.37 GB |
+| | `all` | 744 s | 0.34× speed | 4.24 GB (−15%) | 5.98 GB |
+| int8_convrot (6.2 GB) | `disabled` | 156 s | baseline | 3.43 GB | 0.85 GB |
+| | `mixed` | 274 s | 0.57× speed | 0.63 GB (−82%) | 1.42 GB |
+| | `mixed_int8` | 277 s | 0.56× speed | 0.64 GB (−81%) | 1.27 GB |
+| | `all` | 483 s | 0.32× speed | 3.23 GB (−6%) | 5.48 GB |
+
+- `mixed` and `mixed_int8` cut peak compute-GPU VRAM by over 80% for both formats. That room can go to larger latents or longer videos.
+- For GGUF, `mixed_int8` is also faster than the baseline, because Kitchen's int8 GEMM replaces per-layer dequantization. An int8_convrot checkpoint is already int8, so `mixed_int8` behaves like `mixed`, and the `disabled` baseline is already fast.
+- `all` is slow on this pair because the Vega APU is much slower than the RX 5600M at GEMMs. It is meant for two similar GPUs.
 
 ## Installation
 
