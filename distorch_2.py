@@ -4,12 +4,14 @@ Contains all safetensor related code for distributed memory management
 """
 
 import contextlib
+import contextvars
 import functools
 import itertools
 import math
 import torch
 import logging
 import re
+import sys
 from collections import defaultdict, namedtuple
 
 logger = logging.getLogger("MultiGPU")
@@ -1052,7 +1054,7 @@ def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=F
     reasons = []
     if not is_vae and not hasattr(model, "diffusion_model"):
         reasons.append("model has no diffusion model or VAE")
-    # VAE attention stays on the donor, so only diffusion models need Kitchen attention.
+    # VAEs run whichever attention ComfyUI selected, so only diffusion models need Kitchen attention.
     if not is_vae and not _is_comfy_kitchen_attention_enabled():
         reasons.append("Comfy Kitchen attention is disabled")
     if not donors:
@@ -1120,11 +1122,73 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
     diffusion_model._mgpu_attention_plan = {}
 
 
-def configure_mixed_vae(vae_model, donor_device, compute_device):
+# (compute device, attention plan) of the mixed_int8 VAE call running now.
+_vae_attention_target = contextvars.ContextVar("mgpu_vae_attention_target", default=None)
+# Modules whose optimized_attention global _route_attention_to_compute has wrapped.
+_routed_attention_modules = set()
+
+
+def _vae_attention_on_compute(func, *args, **kwargs):
+    """Run attention on the compute GPU during a mixed_int8 VAE call, and where it is otherwise."""
+    target = _vae_attention_target.get()
+    if target is None:
+        return func(*args, **kwargs)
+    # Attention that func calls in turn runs where func runs it.
+    token = _vae_attention_target.set(None)
+    try:
+        return _run_attention_on_compute(
+            func, *args, compute_device=target[0], plan=target[1], **kwargs
+        )
+    finally:
+        _vae_attention_target.reset(token)
+
+
+def _run_vae_block_attention(q, k, v):
+    """A vae_attention() block's single-head attention, through _vae_attention_on_compute.
+
+    VAE attention takes (batch, channels, *spatial) tensors with one head over
+    all channels. Batch items (frames, for video VAEs) are independent, so
+    they are passed as heads and their chunks pipeline through
+    _run_attention_on_compute.
+    """
+    from comfy.ldm.modules.attention import attention_pytorch, optimized_attention
+
+    shape = q.shape
+    q, k, v = (
+        tensor.reshape(shape[0], shape[1], -1).transpose(1, 2).contiguous().unsqueeze(0)
+        for tensor in (q, k, v)
+    )
+    # Comfy Kitchen attention takes head dims up to 256.
+    func = optimized_attention if shape[1] <= 256 else attention_pytorch
+    output = _vae_attention_on_compute(
+        func, q, k, v, shape[0], skip_reshape=True, skip_output_reshape=True
+    )
+    return output[0].transpose(1, 2).reshape(shape)
+
+
+def _route_attention_to_compute(module_name):
+    """Send a model module's direct optimized_attention calls through _vae_attention_on_compute.
+
+    Transformer VAE decoders such as MiniMax H3's call the attention function
+    they imported instead of a vae_attention() block.
+    """
+    if module_name in _routed_attention_modules:
+        return
+    _routed_attention_modules.add(module_name)
+    module_globals = vars(sys.modules[module_name])
+    attention = module_globals.get("optimized_attention")
+    if attention is not None:
+        module_globals["optimized_attention"] = functools.partial(
+            _vae_attention_on_compute, attention
+        )
+
+
+def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
     """Run VAE encode and decode on the donor; conv and linear GEMMs go to the compute GPU.
 
-    Activations, norms, attention, upsampling and temporal caches stay on the
-    donor, so the compute GPU only holds conv tiles (see configure_mixed_gemm).
+    Activations, norms, upsampling and temporal caches stay on the donor, so
+    the compute GPU only holds conv tiles (see configure_mixed_gemm). With
+    int8, attention also runs on the compute GPU (see _vae_attention_on_compute).
     """
     if not hasattr(vae_model, "_mgpu_original_methods"):
         vae_model._mgpu_original_methods = {}
@@ -1142,8 +1206,12 @@ def configure_mixed_vae(vae_model, donor_device, compute_device):
                 if "device" in kwargs:
                     donor_kwargs["device"] = donor
                 donor_args = _move_tensors(args, donor)
-                with torch.cuda.device_of(_first_tensor(donor_args)):
-                    output = method(*donor_args, **donor_kwargs)
+                token = _vae_attention_target.set(vae_model._mgpu_attention_target)
+                try:
+                    with torch.cuda.device_of(_first_tensor(donor_args)):
+                        output = method(*donor_args, **donor_kwargs)
+                finally:
+                    _vae_attention_target.reset(token)
                 if output is kwargs.get("output_buffer"):
                     return output
                 return _move_tensors(output, output_device)
@@ -1156,13 +1224,22 @@ def configure_mixed_vae(vae_model, donor_device, compute_device):
                 vae_model._mgpu_original_methods[name] = method
                 setattr(vae_model, name, donor_call(method))
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, conv GEMMs on %s",
+            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, GEMMs%s on %s",
             donor_device,
+            " and attention" if int8 else "",
             compute_device,
         )
 
     vae_model._mgpu_donor_execution_device = torch.device(donor_device)
     vae_model._mgpu_compute_device = torch.device(compute_device)
+    # Attention chunk sizes learned from OOMs are kept until the next load.
+    vae_model._mgpu_attention_target = (torch.device(compute_device), {}) if int8 else None
+    if int8:
+        for module in vae_model.modules():
+            # ComfyUI's VAE attention blocks call the vae_attention() they store as optimized_attention.
+            if hasattr(module, "optimized_attention"):
+                module.optimized_attention = _run_vae_block_attention
+            _route_attention_to_compute(type(module).__module__)
 
 
 def configure_hip_donor_gemm_offload(
@@ -1585,8 +1662,7 @@ def register_patched_safetensor_modelpatcher():
                 and hasattr(self.model, "decode")
             )
             mixed_donor_device = None
-            # VAEs stay on the full-precision mixed path.
-            mixed_int8 = donor_gemm_execution_mode == "mixed_int8" and not is_vae
+            mixed_int8 = donor_gemm_execution_mode == "mixed_int8"
             int8_layers = 0
             schedule = None
             if donor_gemm_execution_mode in ("mixed", "mixed_int8"):
@@ -1606,6 +1682,9 @@ def register_patched_safetensor_modelpatcher():
                 )
                 if not is_vae:
                     schedule = _MixedSchedule(device_to, mixed_donor_device)
+                if mixed_int8:
+                    # A VAE has no inference dtype of its own; its weights are stored in it.
+                    int8_dtype = model_original_dtype if is_vae else self.model.get_dtype_inference()
 
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
@@ -1660,7 +1739,7 @@ def register_patched_safetensor_modelpatcher():
                                 module_object,
                                 module_name,
                                 self.patches,
-                                self.model.get_dtype_inference(),
+                                int8_dtype,
                                 mixed_donor_device,
                                 self.patches_uuid,
                             )
@@ -1767,7 +1846,7 @@ def register_patched_safetensor_modelpatcher():
                             module_object,
                             module_name,
                             self.patches,
-                            self.model.get_dtype_inference(),
+                            int8_dtype,
                             mixed_donor_device,
                             self.patches_uuid,
                         )
@@ -1793,7 +1872,7 @@ def register_patched_safetensor_modelpatcher():
                     mixed_donor_device,
                 )
             if mixed_donor_device is not None and is_vae:
-                configure_mixed_vae(self.model, mixed_donor_device, device_to)
+                configure_mixed_vae(self.model, mixed_donor_device, device_to, mixed_int8)
             elif mixed_donor_device is not None:
                 configure_mixed_execution(
                     self.model.diffusion_model, mixed_donor_device, device_to, schedule

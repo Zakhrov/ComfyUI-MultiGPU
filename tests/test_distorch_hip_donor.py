@@ -327,6 +327,81 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertEqual(donor, torch.device("cuda:1"))
 
+    def test_mixed_int8_vae_runs_attention_on_compute_with_frames_as_heads(self):
+        calls = []
+
+        def attention(name):
+            def run(q, k, v, heads, mask=None, skip_reshape=False, skip_output_reshape=False):
+                calls.append((name, heads))
+                return functional.scaled_dot_product_attention(q, k, v)
+
+            return run
+
+        attention_module = types.ModuleType("comfy.ldm.modules.attention")
+        attention_module.optimized_attention = attention("optimized")
+        attention_module.attention_pytorch = attention("pytorch")
+        class VAEModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block = torch.nn.Module()
+                self.block.optimized_attention = None
+
+            def encode(self, q, k, v):
+                return self.block.optimized_attention(q, k, v)
+
+        model = VAEModel()
+        self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
+
+        # Kitchen attention takes head dims up to 256; VAE heads span all channels.
+        for shape, name in (((2, 4, 3, 3), "optimized"), ((1, 257, 2, 2), "pytorch")):
+            q, k, v = (torch.randn(shape) for _ in range(3))
+            calls.clear()
+            with (
+                mock.patch.dict(sys.modules, {attention_module.__name__: attention_module}),
+                mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
+                mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
+            ):
+                output = model.encode(q, k, v)
+
+            q, k, v = (t.reshape(shape[0], 1, shape[1], -1).transpose(2, 3) for t in (q, k, v))
+            expected = functional.scaled_dot_product_attention(q, k, v).transpose(2, 3).reshape(shape)
+            self.assertTrue(torch.allclose(output, expected, atol=1e-5))
+            self.assertEqual(calls, shape[0] * [(name, 1)])
+
+    def test_mixed_int8_vae_routes_direct_attention_calls_to_compute(self):
+        heads_seen = []
+
+        def attention(q, k, v, heads, mask=None, skip_reshape=False, skip_output_reshape=False):
+            heads_seen.append(heads)
+            out = functional.scaled_dot_product_attention(q, k, v)
+            return out if skip_output_reshape else out.transpose(1, 2).flatten(2)
+
+        vae_module = types.ModuleType("mgpu_test_vae")
+        vae_module.optimized_attention = attention
+
+        class VAEModel(torch.nn.Module):
+            __module__ = vae_module.__name__
+
+            def decode(self, q, k, v):
+                return vae_module.optimized_attention(q, k, v, 2, skip_reshape=True)
+
+        model = VAEModel()
+        q, k, v = (torch.randn(1, 2, 5, 4) for _ in range(3))
+        with (
+            mock.patch.dict(sys.modules, {vae_module.__name__: vae_module}),
+            mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
+        ):
+            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
+            output = model.decode(q, k, v)
+            outside = vae_module.optimized_attention(q, k, v, 2, skip_reshape=True)
+
+        expected = attention(q, k, v, 2, skip_reshape=True)
+        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
+        self.assertTrue(torch.equal(outside, expected))
+        # The mixed call runs head chunks on the compute GPU; a call outside it runs unchanged.
+        self.assertEqual(heads_seen, [1, 1, 2, 2])
+
     def test_attention_chunks_heads_over_the_whole_sequence(self):
         q, k, v = (torch.randn(1, 2, 9, 4) for _ in range(3))
         calls = []
