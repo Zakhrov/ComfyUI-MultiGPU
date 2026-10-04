@@ -25,11 +25,14 @@ def load_distorch_module():
     model_management = types.ModuleType("comfy.model_management")
     model_management.get_free_memory = lambda *_: 0
     model_patcher = types.ModuleType("comfy.model_patcher")
+    quant_ops = types.ModuleType("comfy.quant_ops")
+    quant_ops.QuantizedTensor = type("QuantizedTensor", (torch.Tensor,), {})
     comfy.model_management = model_management
     comfy.model_patcher = model_patcher
     sys.modules["comfy"] = comfy
     sys.modules["comfy.model_management"] = model_management
     sys.modules["comfy.model_patcher"] = model_patcher
+    sys.modules["comfy.quant_ops"] = quant_ops
 
     device_utils = types.ModuleType(f"{package_name}.device_utils")
     device_utils.get_device_list = lambda: ["cpu"]
@@ -497,14 +500,16 @@ class TestHipDonorGemmOffload(unittest.TestCase):
     def test_mixed_execution_moves_model_to_donor_and_routes_attention(self):
         calls = []
 
-        class DiffusionModel:
+        class DiffusionModel(torch.nn.Module):
             def forward(self, x, timestep, transformer_options={}):
                 calls.append(transformer_options)
                 return [x[0] * 2]
 
         model = DiffusionModel()
         transformer_options = {"patches": {}}
-        schedule = types.SimpleNamespace(start_forward=lambda: calls.append("start_forward"))
+        schedule = types.SimpleNamespace(
+            start_forward=lambda: calls.append("start_forward"), mlp_linears={}
+        )
         self.distorch.configure_mixed_execution(model, "cpu", "cpu", schedule)
         output = model.forward(
             [torch.ones(2)], torch.zeros(1), transformer_options=transformer_options
@@ -734,6 +739,95 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertIsNone(second._mgpu_staged)
         self.assertEqual(list(first.children()), [])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")
+    def test_mixed_units_measure_the_budget_once_per_forward(self):
+        device = torch.device("cuda:0")
+        schedule = self.distorch._MixedSchedule(device, device)
+        linears = [torch.nn.Linear(256, 256).requires_grad_(False) for _ in range(3)]
+        for module in linears:
+            self.distorch.configure_mixed_gemm(module, device, device, schedule=schedule)
+        x = torch.randn(64, 256, device=device)
+        measured = []
+
+        def budget(*_):
+            measured.append(None)
+            return 1 << 30
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30, create=True), \
+                mock.patch.object(self.distorch, "_compute_budget", budget):
+            for _ in range(2):
+                schedule.start_forward()
+                for module in linears:
+                    x = module(x)
+
+        self.assertEqual(len(measured), 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")
+    def test_fused_mlp_runs_whole_on_compute(self):
+        device = torch.device("cuda:0")
+
+        class FeedForward(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = torch.nn.Linear(256, 512, bias=False)
+                self.w2 = torch.nn.Linear(512, 256, bias=False)
+                self.w3 = torch.nn.Linear(256, 512, bias=False)
+
+            def forward(self, x):
+                return self.w2(functional.silu(self.w1(x)) * self.w3(x))
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(256, 256)
+                self.feed_forward = FeedForward()
+                self.mlp = torch.nn.Sequential(
+                    torch.nn.Linear(256, 512), torch.nn.GELU(), torch.nn.Linear(512, 256)
+                )
+
+            def forward(self, x, timestep, transformer_options={}):
+                return self.mlp(self.feed_forward(self.proj(x)))
+
+        model = Model().requires_grad_(False)
+        x = torch.randn(2, 64, 256)
+        expected = model.forward(x, None)
+        schedule = self.distorch._MixedSchedule(device, device)
+        for module in model.modules():
+            self.distorch.configure_mixed_gemm(module, device, "cpu", schedule=schedule)
+        self.distorch.configure_mixed_execution(model, "cpu", device, schedule)
+        self.assertEqual(
+            schedule.mlp_linears,
+            {
+                model.feed_forward: [model.feed_forward.w1, model.feed_forward.w3, model.feed_forward.w2],
+                model.mlp: [model.mlp[0], model.mlp[2]],
+            },
+        )
+        hidden_devices = []
+        model.mlp[1].register_forward_hook(
+            lambda _, inputs, __: hidden_devices.append(inputs[0].device)
+        )
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30, create=True):
+            for _ in range(2):
+                output = model.forward(x, None)
+                self.assertEqual(output.device, x.device)
+                self.assertTrue(torch.allclose(output, expected, atol=1e-4))
+            self.assertIs(schedule.following[model.feed_forward], model.mlp)
+        self.assertTrue(hidden_devices)
+        self.assertTrue(all(hidden == device for hidden in hidden_devices))
+        self.assertTrue(all(linear._mgpu_fused is None for linear in model.mlp[::2]))
+
+    def test_fused_mlps_hold_only_staged_linears_and_activations(self):
+        schedule = object()
+        normed = torch.nn.Sequential(torch.nn.LayerNorm(4), torch.nn.Linear(4, 4))
+        single = torch.nn.Sequential(torch.nn.SiLU(), torch.nn.Linear(4, 4))
+        unstaged = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+        normed[1]._mgpu_schedule = single[1]._mgpu_schedule = schedule
+        unstaged[0]._mgpu_schedule = schedule
+
+        for module in (normed, single, unstaged):
+            self.assertIsNone(self.distorch._fused_mlp_linears(module, schedule))
 
     def test_mixed_int8_needs_convrot_group_aligned_features(self):
         self.assertTrue(self.distorch._is_mixed_int8_linear(torch.nn.Linear(512, 4)))

@@ -5,6 +5,7 @@ Contains all safetensor related code for distributed memory management
 
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import itertools
 import math
@@ -205,23 +206,23 @@ def _token_chunks(tokens, token_bytes, budget):
     return [slice(start, min(start + per_chunk, tokens)) for start in range(0, tokens, per_chunk)]
 
 
+def _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up):
+    output_chunk = torch.nn.functional.linear(input_chunk, weight, bias)
+    if lora_down is not None:
+        output_chunk.addmm_(input_chunk @ lora_down.t(), lora_up.t())
+    return output_chunk
+
+
 def _run_linear_chunks(
     flat_input, output, weight, bias, lora_down, lora_up, chunks, compute_device, during=None
 ):
     """Stream token chunks through a linear whose weight is already on the compute GPU."""
-
-    def run(input_chunk):
-        output_chunk = torch.nn.functional.linear(input_chunk, weight, bias)
-        if lora_down is not None:
-            output_chunk.addmm_(input_chunk @ lora_down.t(), lora_up.t())
-        return output_chunk
-
     with _current_device(compute_device):
         _pipeline_on_compute(
             chunks,
             compute_device,
             lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
-            run,
+            lambda input_chunk: _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up),
             lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
             during,
         )
@@ -742,15 +743,17 @@ def _run_donor_prepared_linear_on_compute(
 
 
 class _MixedSchedule:
-    """The order a model's mixed linears ran in, for staging each next weight early.
+    """The order a model's mixed units ran in, for staging each next unit's weights early.
 
-    A linear stages the next one's weight on the compute GPU from a copy stream
-    while its own last chunks run. Memory allocated on that stream is freed only
-    once the compute stream has finished with it (see retire), since the
-    allocator would otherwise hand it back to the copy stream too early.
+    A unit is a mixed linear or a fused MLP (see _run_fused_mlp). It stages the
+    next unit's weights on the compute GPU from a copy stream while its own last
+    chunks run. Memory allocated on that stream is freed only once the compute
+    stream has finished with it (see retire), since the allocator would
+    otherwise hand it back to the copy stream too early.
     """
 
     def __init__(self, compute_device, donor_device):
+        self.compute_device = compute_device
         self.copy_stream = torch.cuda.Stream(compute_device)
         # Preparing a weight on the donor's default stream would queue it ahead of
         # the chunk copies, which run there.
@@ -758,9 +761,11 @@ class _MixedSchedule:
         # Kept here, not on the modules: a module stored on another would be
         # registered as its submodule.
         self.following = {}
+        self.mlp_linears = {}
         self.previous = None
         self.pending = []
         self.retired = []
+        self.free = None
 
     def start_forward(self):
         # Stages left from an interrupted forward would pin compute memory.
@@ -768,6 +773,28 @@ class _MixedSchedule:
             module._mgpu_staged = None
         self.pending = []
         self.previous = None
+        self.free = None
+
+    def linears(self, unit):
+        return self.mlp_linears.get(unit, (unit,))
+
+    def weight_bytes(self, unit, dtype):
+        return sum(_staged_weight_bytes(linear, dtype) for linear in self.linears(unit))
+
+    def stage(self, unit, dtype):
+        """Stage a unit's weights, or None when one is too large and streams in tiles instead."""
+        staged = tuple(_stage_linear(linear, dtype, self) for linear in self.linears(unit))
+        return None if any(linear is None for linear in staged) else staged
+
+    def budget(self, staged_bytes):
+        """Tile budget while staged_bytes of weights are on the compute GPU.
+
+        Measured once per forward: _compute_budget synchronizes every device, so
+        measuring at every unit would drain the pipeline between them.
+        """
+        if self.free is None:
+            self.free = _compute_budget(self.compute_device) + staged_bytes
+        return self.free - staged_bytes
 
     def retire(self, staged, compute_stream):
         for _, done in self.retired:
@@ -780,6 +807,29 @@ _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype
 
 def _staged_weight_bytes(module, dtype):
     return module.out_features * module.in_features * (1 if module._mgpu_int8 else dtype.itemsize)
+
+
+def _copy_to_compute(weight, compute_device):
+    """Copy a weight to the compute GPU without blocking the host.
+
+    QuantizedTensor.to() ignores non_blocking, so an int8 weight's parts are
+    copied here; its small pageable scales go first so that they don't wait
+    behind the pinned data.
+    """
+    from comfy.quant_ops import QuantizedTensor
+
+    if not isinstance(weight, QuantizedTensor):
+        return weight.to(device=compute_device, non_blocking=True)
+    params = weight.params
+    params = dataclasses.replace(
+        params,
+        **{
+            name: getattr(params, name).to(device=compute_device, non_blocking=True)
+            for name in params._tensor_fields()
+        },
+    )
+    qdata = weight._qdata.to(device=compute_device, non_blocking=True)
+    return QuantizedTensor(qdata, weight._layout_cls, params)
 
 
 def _stage_linear(module, dtype, schedule=None):
@@ -808,7 +858,7 @@ def _stage_linear(module, dtype, schedule=None):
                 module, dtype, module._mgpu_donor_execution_device
             )
         try:
-            staged_weight = weight.to(device=compute_device, non_blocking=True)
+            staged_weight = _copy_to_compute(weight, compute_device)
             staged_bias = None if bias is None else bias.to(device=compute_device, non_blocking=True)
             lora_down, lora_up = _lora_on_compute(lora, compute_device, dtype)
         finally:
@@ -842,46 +892,104 @@ def _run_staged_linear(input_tensor, staged, compute_device, budget, during=None
     return output.reshape(*input_tensor.shape[:-1], out_features)
 
 
-def _run_mixed_linear(input_tensor, module):
-    """Run a mixed linear on the compute GPU from a staged weight, and stage the next one.
+def _take_staged(unit, dtype, schedule):
+    """A unit's weights, as the previous unit staged them or staged now."""
+    staged = unit._mgpu_staged
+    unit._mgpu_staged = None
+    if staged is None or staged[0].dtype != dtype:
+        staged = schedule.stage(unit, dtype)
+    return staged
 
-    The schedule learns the order linears run in during each forward, so no
-    model-specific knowledge is needed: once this linear's first chunk is
-    queued, the next one's weight is prepared on the donor and copied to the
-    compute GPU while the rest of this linear runs.
+
+def _start_unit(unit, staged, dtype, schedule):
+    """Record a unit as running now and wait for its weights.
+
+    The schedule learns the order units run in during each forward, so no
+    model-specific knowledge is needed. Returns the unit's tile budget and a
+    callback that stages the following unit's weights once the unit's first
+    chunk is queued, so they are prepared and copied while the rest runs.
     """
+    if schedule.previous is not None:
+        schedule.following[schedule.previous] = unit
+    schedule.previous = unit
+    budget = schedule.budget(schedule.weight_bytes(unit, dtype))
+    compute_stream = torch.cuda.current_stream(schedule.compute_device)
+    for linear in staged:
+        compute_stream.wait_event(linear.ready)
+    following = schedule.following.get(unit)
+    if following is None or following is unit:
+        return budget, None
+
+    def during():
+        following._mgpu_staged = schedule.stage(following, dtype)
+        schedule.pending.append(following)
+
+    return budget - schedule.weight_bytes(following, dtype), during
+
+
+def _run_mixed_linear(input_tensor, module):
+    """Run a mixed linear on the compute GPU from a staged weight, and stage the next unit."""
     compute_device = module._mgpu_compute_device
     schedule = module._mgpu_schedule
-    staged = module._mgpu_staged
-    module._mgpu_staged = None
-    if staged is None or staged.dtype != input_tensor.dtype:
+    if schedule is None:
         staged = _stage_linear(module, input_tensor.dtype)
+        if staged is not None:
+            return _run_staged_linear(
+                input_tensor, staged, compute_device, _compute_budget(compute_device)
+            )
+    else:
+        staged = _take_staged(module, input_tensor.dtype, schedule)
     if staged is None:
         return _run_donor_prepared_linear_on_compute(
             input_tensor, module, compute_device, module._mgpu_donor_execution_device
         )
-    budget = _compute_budget(compute_device)
-    if schedule is None:
-        return _run_staged_linear(input_tensor, staged, compute_device, budget)
-
-    if schedule.previous is not None:
-        schedule.following[schedule.previous] = module
-    schedule.previous = module
-    following = schedule.following.get(module)
-    during = None
-    if following is not None and following is not module:
-        budget -= _staged_weight_bytes(following, input_tensor.dtype)
-
-        def during():
-            following._mgpu_staged = _stage_linear(following, input_tensor.dtype, schedule)
-            schedule.pending.append(following)
-
-    compute_stream = torch.cuda.current_stream(compute_device)
-    if staged.ready is not None:
-        compute_stream.wait_event(staged.ready)
-    output = _run_staged_linear(input_tensor, staged, compute_device, budget, during)
-    schedule.retire(staged, compute_stream)
+    budget, during = _start_unit(module, staged, input_tensor.dtype, schedule)
+    output = _run_staged_linear(input_tensor, staged[0], compute_device, budget, during)
+    schedule.retire(staged, torch.cuda.current_stream(compute_device))
     return output
+
+
+def _run_fused_mlp(input_tensor, mlp):
+    """Run a token-wise MLP whole on the compute GPU, one token chunk at a time.
+
+    Each chunk is copied there and its result back once, so the wide hidden
+    activation never visits the donor and the activation function runs on the
+    compute GPU. Its linears run the weights staged here (see configure_mixed_gemm).
+    """
+    schedule = mlp._mgpu_schedule
+    compute_device = schedule.compute_device
+    staged = _take_staged(mlp, input_tensor.dtype, schedule)
+    if staged is None:
+        return mlp._mgpu_original_forward(input_tensor)
+    linears = schedule.linears(mlp)
+    budget, during = _start_unit(mlp, staged, input_tensor.dtype, schedule)
+    flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
+    tokens = flat_input.shape[0]
+    output = torch.empty(
+        (tokens, linears[-1].out_features), device=input_tensor.device, dtype=input_tensor.dtype
+    )
+    # The input and every linear's output, doubled for activations and kernel temporaries.
+    token_bytes = (
+        2 * (flat_input.shape[-1] + sum(linear.out_features for linear in linears))
+        * output.element_size()
+    )
+    for linear, weights in zip(linears, staged):
+        linear._mgpu_fused = weights
+    try:
+        with _current_device(compute_device):
+            _pipeline_on_compute(
+                _token_chunks(tokens, token_bytes, budget),
+                compute_device,
+                lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
+                mlp._mgpu_original_forward,
+                lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
+                during,
+            )
+    finally:
+        for linear in linears:
+            linear._mgpu_fused = None
+    schedule.retire(staged, torch.cuda.current_stream(compute_device))
+    return output.reshape(*input_tensor.shape[:-1], output.shape[-1])
 
 
 def _run_quantized_linear_on_compute(input_tensor, module, compute_device):
@@ -990,6 +1098,8 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
     module._mgpu_int8 = int8
     module._mgpu_schedule = schedule
     module._mgpu_staged = None
+    # The weight a fused MLP staged for this linear while it runs (see _run_fused_mlp).
+    module._mgpu_fused = None
     if not hasattr(module, "_mgpu_original_forward"):
         module._mgpu_original_forward = module.forward
         module._mgpu_donor_gemm_calls = 0
@@ -997,6 +1107,11 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
         def mixed_forward(*args, **kwargs):
             if len(args) != 1 or kwargs or not isinstance(args[0], torch.Tensor):
                 return module._mgpu_original_forward(*args, **kwargs)
+            fused = module._mgpu_fused
+            if fused is not None:
+                return _linear_on_compute(
+                    args[0], fused.weight, fused.bias, fused.lora_down, fused.lora_up
+                )
             # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
             if getattr(module, "layout_type", None) is not None:
                 output = _run_quantized_linear_on_compute(
@@ -1017,6 +1132,56 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
 
         module.forward = mixed_forward
     return True
+
+
+# Elementwise modules that may sit between a Sequential MLP's linears.
+_MLP_ACTIVATIONS = (
+    torch.nn.GELU,
+    torch.nn.SiLU,
+    torch.nn.ReLU,
+    torch.nn.Tanh,
+    torch.nn.Sigmoid,
+    torch.nn.Dropout,
+    torch.nn.Identity,
+)
+
+
+def _fused_mlp_linears(module, schedule):
+    """The linears of a token-wise MLP whose GEMMs all run staged on the compute GPU, or None.
+
+    Token-wise MLPs are a Sequential of linears and activations, or a SwiGLU
+    FeedForward's w1, w3 and w2 (as in Lumina and Z-Image).
+    """
+    children = dict(module.named_children())
+    if isinstance(module, torch.nn.Sequential):
+        linears = [child for child in children.values() if not isinstance(child, _MLP_ACTIVATIONS)]
+    elif children.keys() == {"w1", "w2", "w3"}:
+        linears = [children["w1"], children["w3"], children["w2"]]
+    else:
+        return None
+    if len(linears) < 2 or any(
+        getattr(linear, "_mgpu_schedule", None) is not schedule
+        or getattr(linear, "layout_type", None) is not None
+        for linear in linears
+    ):
+        return None
+    return linears
+
+
+def configure_fused_mlp(mlp, linears, schedule):
+    """Run a token-wise MLP whole on the compute GPU in token chunks (see _run_fused_mlp)."""
+    schedule.mlp_linears[mlp] = linears
+    mlp._mgpu_schedule = schedule
+    mlp._mgpu_staged = None
+    if not hasattr(mlp, "_mgpu_original_forward"):
+        mlp._mgpu_original_forward = mlp.forward
+
+        def fused_forward(*args, **kwargs):
+            if len(args) != 1 or kwargs or not isinstance(args[0], torch.Tensor):
+                return mlp._mgpu_original_forward(*args, **kwargs)
+            return _run_fused_mlp(args[0], mlp)
+
+        mlp.forward = fused_forward
 
 
 def _first_tensor(value):
@@ -1073,8 +1238,9 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
     """Run the diffusion model on the donor and send attention to the compute GPU.
 
     Activations, norms, modulation, rope and weight preparation stay on the
-    donor. Linears and convs (see configure_mixed_gemm) and attention run their GEMMs on
-    the compute GPU in tiles sized to its free VRAM.
+    donor. Linears and convs (see configure_mixed_gemm), token-wise MLPs (see
+    _run_fused_mlp) and attention run on the compute GPU in tiles sized to its
+    free VRAM.
     """
     if not hasattr(diffusion_model, "_mgpu_original_forward"):
         diffusion_model._mgpu_original_forward = diffusion_model.forward
@@ -1120,6 +1286,16 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
     diffusion_model._mgpu_schedule = schedule
     # Chunk sizes learned from OOMs, a few ints per attention shape, kept until the next load.
     diffusion_model._mgpu_attention_plan = {}
+    for module in diffusion_model.modules():
+        linears = _fused_mlp_linears(module, schedule)
+        if linears is not None:
+            configure_fused_mlp(module, linears, schedule)
+    if schedule.mlp_linears:
+        logger.info(
+            "[MultiGPU DisTorch V2] Mixed execution: %d MLPs run whole on %s in token chunks",
+            len(schedule.mlp_linears),
+            compute_device,
+        )
 
 
 # (compute device, attention plan) of the mixed_int8 VAE call running now.
@@ -1686,6 +1862,25 @@ def register_patched_safetensor_modelpatcher():
                     # A VAE has no inference dtype of its own; its weights are stored in it.
                     int8_dtype = model_original_dtype if is_vae else self.model.get_dtype_inference()
 
+            def prepare_int8(module_object, module_name):
+                keys = [f"{module_name}._mgpu_int8_weight", f"{module_name}._mgpu_int8_bias"]
+                if getattr(module_object, "_mgpu_int8_key", None) != self.patches_uuid:
+                    # New patches replace the int8 weights; release the old pins first.
+                    for key in keys:
+                        self.unpin_weight(key)
+                _prepare_mixed_int8_weight(
+                    module_object,
+                    module_name,
+                    self.patches,
+                    int8_dtype,
+                    mixed_donor_device,
+                    self.patches_uuid,
+                )
+                # Pinned, the weight copies to the compute GPU while the previous unit runs.
+                # Also re-pins weights reused after unpatch_model unpinned them.
+                for key in keys:
+                    self.pin_weight_to_device(key)
+
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
             loading.sort(reverse=True)
@@ -1735,14 +1930,7 @@ def register_patched_safetensor_modelpatcher():
                             module_object, device_to, mixed_donor_device, int8_layer, schedule
                         )
                         if int8_layer:
-                            _prepare_mixed_int8_weight(
-                                module_object,
-                                module_name,
-                                self.patches,
-                                int8_dtype,
-                                mixed_donor_device,
-                                self.patches_uuid,
-                            )
+                            prepare_int8(module_object, module_name)
                             int8_layers += 1
                     else:
                         configure_hip_donor_gemm_offload(
@@ -1842,14 +2030,7 @@ def register_patched_safetensor_modelpatcher():
                         module_object, device_to, mixed_donor_device, int8_layer, schedule
                     )
                     if int8_layer:
-                        _prepare_mixed_int8_weight(
-                            module_object,
-                            module_name,
-                            self.patches,
-                            int8_dtype,
-                            mixed_donor_device,
-                            self.patches_uuid,
-                        )
+                        prepare_int8(module_object, module_name)
                         int8_layers += 1
                 elif configure_hip_donor_gemm_offload(
                     module_object,

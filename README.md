@@ -66,6 +66,7 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
   - Activations, norms, modulation, RoPE, residuals, dequantization and weight patches stay on the donor. The donor's memory holds activations, so high-resolution images and long videos are limited by donor memory (for example an APU using shared system RAM), not compute-GPU VRAM.
   - Linear GEMMs are sent to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied back to the donor. Work is split into at least 8 chunks, and the copies run on a side stream overlapping neighbouring chunks' compute. At most two chunks are in flight.
   - Each linear prepares the next linear's weight on a separate donor stream while the current GEMM runs. Nothing is staged across forwards.
+  - Token-wise MLPs (SwiGLU `w1`/`w2`/`w3` feed-forwards and `Sequential` linear/activation MLPs) run whole on the compute GPU, one token chunk at a time, so their wide hidden activation never returns to the donor. The compute GPU holds the MLP's weights together for that layer.
   - Attention runs on the compute GPU in chunks of whole heads. On OOM the chunk is halved and the smaller size is kept until the model reloads; attention falls back to the donor only if a single head doesn't fit. Requires Comfy Kitchen attention.
   - Weights stay where they were loaded (GGUF memory-mapped on disk, safetensors in RAM) and are prepared on the donor one layer at a time. The compute GPU holds no weights, only GEMM tiles and attention chunks. The allocation only selects the donor (the first GPU donor listed).
   - ComfyUI quantized safetensors layers (int8, fp8) send their packed weight to the compute GPU and run their own quantized matmul there.
@@ -75,12 +76,13 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
 
 - **`mixed_int8`**: `mixed`, plus a one-time conversion at load of every linear (GGUF Q4/Q5/Q8 and others, fp16/bf16 safetensors) to ComfyUI's int8 ConvRot layout, run with Comfy Kitchen's int8 GEMM. Requires Comfy Kitchen attention.
   - The int8 weights live in system RAM (about 1 byte per weight, roughly twice a Q4 model) while the model is loaded or cached. The donor keeps only activations, so it has more room than in `mixed`.
+  - The int8 weights are pinned, within ComfyUI's pinned-memory limit, so each one copies to the compute GPU while the previous layer runs.
   - Reloading with the same LoRAs reuses the converted weights; changing LoRAs converts again.
   - Requantizing a GGUF weight adds a second rounding on top of its own quantization.
   - Plain LoRAs, linears whose input features aren't a multiple of 256, and convs run at full precision as in `mixed`.
   - VAEs convert their linears too, and their attention runs on the compute GPU in chunks of frames or heads, with ComfyUI's selected attention (Comfy Kitchen) where the head dim is at most 256 and PyTorch SDPA otherwise. Everything else stays on the donor as in `mixed`. On the RX 5600M + Vega APU pair: MiniMax H3 decode 13.5 s → 4.8 s (17 frames, 256²), Flux encode 5.0 s → 3.7 s and decode 8.2 s → 6.9 s (1024², identical output), Wan 2.1 encode 36.9 s → 34.5 s (17 frames, 480×832).
 
-- **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins CPU weights, since only donor GEMMs read host memory directly.
+- **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins the original CPU weights, since only donor GEMMs read host memory directly.
 
 ### Benchmarks
 
