@@ -1860,7 +1860,11 @@ def register_patched_safetensor_modelpatcher():
                     schedule = _MixedSchedule(device_to, mixed_donor_device)
                 if mixed_int8:
                     # A VAE has no inference dtype of its own; its weights are stored in it.
-                    int8_dtype = model_original_dtype if is_vae else self.model.get_dtype_inference()
+                    if is_vae:
+                        float_sd = {k: v for k, v in self.model.state_dict().items() if v.dtype.is_floating_point}
+                        int8_dtype = comfy.utils.weight_dtype(float_sd)
+                    else:
+                        int8_dtype = self.model.get_dtype_inference()
 
             def prepare_int8(module_object, module_name):
                 keys = [f"{module_name}._mgpu_int8_weight", f"{module_name}._mgpu_int8_bias"]
