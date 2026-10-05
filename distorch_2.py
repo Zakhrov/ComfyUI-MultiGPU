@@ -45,6 +45,9 @@ _ATTENTION_RESERVE_BYTES = 128 * 1024 * 1024
 # Chunks per mixed GEMM or attention call: with several, each chunk's copies to
 # and from the compute GPU overlap the neighbouring chunks' compute.
 _PIPELINE_CHUNKS = 8
+# Comfy Kitchen's int8 GEMM computes whole 128-row tiles, so a chunk of 520 rows
+# costs as much as 640. Chunks are cut to a multiple of this.
+_GEMM_ROW_TILE = 128
 # Conv tiles stop getting faster well below this, and larger ones let the
 # backend's im2col workspace exhaust the compute GPU. A fixed cap also keeps
 # tile shapes stable so MIOpen reuses its tuned kernels between runs.
@@ -203,6 +206,8 @@ def _token_chunks(tokens, token_bytes, budget):
     one being stored.
     """
     per_chunk = max(1, min(-(-tokens // _PIPELINE_CHUNKS), budget // (3 * token_bytes)))
+    if per_chunk > _GEMM_ROW_TILE:
+        per_chunk -= per_chunk % _GEMM_ROW_TILE
     return [slice(start, min(start + per_chunk, tokens)) for start in range(0, tokens, per_chunk)]
 
 
@@ -806,6 +811,8 @@ _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype
 
 
 def _staged_weight_bytes(module, dtype):
+    if module._mgpu_quantized:
+        return mm.module_size(module)
     return module.out_features * module.in_features * (1 if module._mgpu_int8 else dtype.itemsize)
 
 
@@ -835,12 +842,12 @@ def _copy_to_compute(weight, compute_device):
 def _stage_linear(module, dtype, schedule=None):
     """Put a mixed linear's GEMM weight on the compute GPU, on the schedule's streams if given.
 
-    mixed_int8 sends its load-time int8 weight; mixed prepares the weight on the
-    donor first. Returns None for a prepared weight larger than half the compute
-    GPU's free memory, which streams in tiles instead.
+    A quantized linear and mixed_int8 send their stored weight; mixed prepares the
+    weight on the donor first. Returns None for a prepared weight larger than half
+    the compute GPU's free memory, which streams in tiles instead.
     """
     compute_device = module._mgpu_compute_device
-    if not module._mgpu_int8 and compute_device.type == "cuda" and (
+    if not (module._mgpu_int8 or module._mgpu_quantized) and compute_device.type == "cuda" and (
         2 * _staged_weight_bytes(module, dtype)
         > mm.get_free_memory(compute_device) - _COMPUTE_GPU_RESERVE_BYTES
     ):
@@ -850,7 +857,10 @@ def _stage_linear(module, dtype, schedule=None):
         streams.enter_context(torch.cuda.stream(schedule.donor_stream))
         streams.enter_context(torch.cuda.stream(schedule.copy_stream))
     with streams:
-        if module._mgpu_int8:
+        if module._mgpu_quantized:
+            weight, bias, lora = module.weight, module.bias, ()
+            offload_state = None
+        elif module._mgpu_int8:
             weight, bias, lora = module._mgpu_int8_weight, module._mgpu_int8_bias, module._mgpu_int8_lora
             offload_state = None
         else:
@@ -949,6 +959,18 @@ def _run_mixed_linear(input_tensor, module):
     return output
 
 
+@contextlib.contextmanager
+def _staged_parameters(module, staged):
+    weight, bias = module.weight, module.bias
+    module.weight = torch.nn.Parameter(staged.weight, requires_grad=False)
+    if bias is not None:
+        module.bias = torch.nn.Parameter(staged.bias, requires_grad=False)
+    try:
+        yield
+    finally:
+        module.weight, module.bias = weight, bias
+
+
 def _run_fused_mlp(input_tensor, mlp):
     """Run a token-wise MLP whole on the compute GPU, one token chunk at a time.
 
@@ -973,9 +995,12 @@ def _run_fused_mlp(input_tensor, mlp):
         2 * (flat_input.shape[-1] + sum(linear.out_features for linear in linears))
         * output.element_size()
     )
-    for linear, weights in zip(linears, staged):
-        linear._mgpu_fused = weights
-    try:
+    with contextlib.ExitStack() as stack:
+        for linear, weights in zip(linears, staged):
+            linear._mgpu_fused = weights
+            stack.callback(setattr, linear, "_mgpu_fused", None)
+            if linear._mgpu_quantized:
+                stack.enter_context(_staged_parameters(linear, weights))
         with _current_device(compute_device):
             _pipeline_on_compute(
                 _token_chunks(tokens, token_bytes, budget),
@@ -985,24 +1010,30 @@ def _run_fused_mlp(input_tensor, mlp):
                 lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
                 during,
             )
-    finally:
-        for linear in linears:
-            linear._mgpu_fused = None
     schedule.retire(staged, torch.cuda.current_stream(compute_device))
     return output.reshape(*input_tensor.shape[:-1], output.shape[-1])
 
 
 def _run_quantized_linear_on_compute(input_tensor, module, compute_device):
-    """Run a ComfyUI quantized linear's own matmul on the compute GPU in token chunks.
+    """Run a ComfyUI quantized linear's own forward on the compute GPU in token chunks.
 
-    Its forward casts the weight to the input's device, so the compute GPU gets
-    the packed weight and runs the quantized GEMM (such as Kitchen int8) itself.
-    Token chunks stream through with their copies overlapping the GEMMs.
+    The packed weight is staged once, and the next unit's while this one runs
+    (see _start_unit). The module's forward runs against the staged weight, so it
+    quantizes each input chunk and runs the quantized GEMM (such as Kitchen int8)
+    itself. Token chunks stream through with their copies overlapping the GEMMs.
     """
+    dtype = input_tensor.dtype
+    schedule = module._mgpu_schedule
+    if schedule is None:
+        staged = (_stage_linear(module, dtype),)
+        budget = _compute_budget(compute_device) - _staged_weight_bytes(module, dtype)
+        during = None
+    else:
+        staged = _take_staged(module, dtype, schedule)
+        budget, during = _start_unit(module, staged, dtype, schedule)
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
     tokens = flat_input.shape[0]
-    # The cast weight and a quantized copy of each input chunk.
-    budget = _compute_budget(compute_device) - mm.module_size(module)
+    # A quantized copy of each input chunk and its output.
     token_bytes = 2 * (module.in_features + module.out_features) * input_tensor.element_size()
     output = None
 
@@ -1014,14 +1045,17 @@ def _run_quantized_linear_on_compute(input_tensor, module, compute_device):
             )
         output[chunk].copy_(result, non_blocking=True)
 
-    with _current_device(compute_device):
+    with _staged_parameters(module, staged[0]), _current_device(compute_device):
         _pipeline_on_compute(
             _token_chunks(tokens, token_bytes, budget),
             compute_device,
             lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
             module._mgpu_original_forward,
             store,
+            during,
         )
+    if schedule is not None:
+        schedule.retire(staged, torch.cuda.current_stream(compute_device))
     return output.reshape(*input_tensor.shape[:-1], output.shape[-1])
 
 
@@ -1096,6 +1130,8 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
 
     module._mgpu_donor_execution_device = torch.device(donor_device)
     module._mgpu_int8 = int8
+    # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
+    module._mgpu_quantized = getattr(module, "layout_type", None) is not None
     module._mgpu_schedule = schedule
     module._mgpu_staged = None
     # The weight a fused MLP staged for this linear while it runs (see _run_fused_mlp).
@@ -1109,11 +1145,12 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
                 return module._mgpu_original_forward(*args, **kwargs)
             fused = module._mgpu_fused
             if fused is not None:
+                if module._mgpu_quantized:
+                    return module._mgpu_original_forward(args[0])
                 return _linear_on_compute(
                     args[0], fused.weight, fused.bias, fused.lora_down, fused.lora_up
                 )
-            # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
-            if getattr(module, "layout_type", None) is not None:
+            if module._mgpu_quantized:
                 output = _run_quantized_linear_on_compute(
                     args[0], module, module._mgpu_compute_device
                 )
@@ -1161,7 +1198,6 @@ def _fused_mlp_linears(module, schedule):
         return None
     if len(linears) < 2 or any(
         getattr(linear, "_mgpu_schedule", None) is not schedule
-        or getattr(linear, "layout_type", None) is not None
         for linear in linears
     ):
         return None
@@ -1298,17 +1334,47 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
         )
 
 
-# (compute device, attention plan) of the mixed_int8 VAE call running now.
+# (compute device, attention plan, int8) of the mixed VAE call running now.
 _vae_attention_target = contextvars.ContextVar("mgpu_vae_attention_target", default=None)
 # Modules whose optimized_attention global _route_attention_to_compute has wrapped.
 _routed_attention_modules = set()
 
 
+def _int8_kitchen_attention(func, compute_device):
+    """Comfy Kitchen int8 attention on the compute GPU for head dims up to 256, func otherwise."""
+    import comfy_kitchen
+    from comfy.ldm.modules.attention import (
+        COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE,
+        attention_comfy_kitchen_int8,
+    )
+
+    if not (
+        COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE
+        and comfy_kitchen.int8_attention_is_available(compute_device)
+    ):
+        return func
+
+    def attention(q, k, v, heads, *args, **kwargs):
+        dim_head = q.shape[-1] if kwargs.get("skip_reshape", False) else q.shape[-1] // heads
+        # An attention that fell back to the donor runs what ComfyUI selected.
+        if dim_head > 256 or q.device != compute_device:
+            return func(q, k, v, heads, *args, **kwargs)
+        return attention_comfy_kitchen_int8(q, k, v, heads, *args, **kwargs)
+
+    return attention
+
+
 def _vae_attention_on_compute(func, *args, **kwargs):
-    """Run attention on the compute GPU during a mixed_int8 VAE call, and where it is otherwise."""
+    """Run attention on the compute GPU during a mixed VAE call, and where it is otherwise.
+
+    An int8 VAE (target[2]) uses Comfy Kitchen int8 attention there, whichever
+    attention ComfyUI selected; other VAEs keep the selected attention.
+    """
     target = _vae_attention_target.get()
     if target is None:
         return func(*args, **kwargs)
+    if target[2]:
+        func = _int8_kitchen_attention(func, target[0])
     # Attention that func calls in turn runs where func runs it.
     token = _vae_attention_target.set(None)
     try:
@@ -1359,12 +1425,51 @@ def _route_attention_to_compute(module_name):
         )
 
 
+def _route_kitchen_int8_attention_to_compute():
+    """Send comfy_kitchen.int8_attention calls through _vae_attention_on_compute.
+
+    MiniMax H3's decoder calls it directly when its weights are already int8,
+    bypassing optimized_attention.
+    """
+    import comfy_kitchen
+
+    if hasattr(comfy_kitchen.int8_attention, "_mgpu_original"):
+        return
+    original = comfy_kitchen.int8_attention
+
+    def run_on_compute(q, k, v, heads, mask=None, skip_reshape=True, skip_output_reshape=True, **kwargs):
+        return original(q, k, v, attn_mask=mask, **kwargs)
+
+    @functools.wraps(original)
+    def int8_attention(q, k, v, *, scale=None, attn_mask=None):
+        if _vae_attention_target.get() is None:
+            return original(q, k, v, scale=scale, attn_mask=attn_mask)
+        return _vae_attention_on_compute(
+            run_on_compute, q, k, v, q.shape[1], attn_mask,
+            skip_reshape=True, skip_output_reshape=True, scale=scale,
+        )
+
+    int8_attention._mgpu_original = original
+    comfy_kitchen.int8_attention = int8_attention
+
+
+def _has_int8_weights(model):
+    """Whether any layer of a model is stored in an int8 quantization format."""
+    from comfy.quant_ops import QUANT_ALGOS
+
+    return any(
+        QUANT_ALGOS.get(getattr(module, "quant_format", None), {}).get("storage_t") == torch.int8
+        for module in model.modules()
+    )
+
+
 def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
     """Run VAE encode and decode on the donor; conv and linear GEMMs go to the compute GPU.
 
     Activations, norms, upsampling and temporal caches stay on the donor, so
-    the compute GPU only holds conv tiles (see configure_mixed_gemm). With
-    int8, attention also runs on the compute GPU (see _vae_attention_on_compute).
+    the compute GPU only holds conv tiles (see configure_mixed_gemm). Attention
+    also runs on the compute GPU (see _vae_attention_on_compute), as Kitchen
+    int8 attention with int8 (mixed_int8, or a VAE whose weights are already int8).
     """
     if not hasattr(vae_model, "_mgpu_original_methods"):
         vae_model._mgpu_original_methods = {}
@@ -1400,22 +1505,22 @@ def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
                 vae_model._mgpu_original_methods[name] = method
                 setattr(vae_model, name, donor_call(method))
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, GEMMs%s on %s",
+            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, GEMMs and attention on %s",
             donor_device,
-            " and attention" if int8 else "",
             compute_device,
         )
 
     vae_model._mgpu_donor_execution_device = torch.device(donor_device)
     vae_model._mgpu_compute_device = torch.device(compute_device)
     # Attention chunk sizes learned from OOMs are kept until the next load.
-    vae_model._mgpu_attention_target = (torch.device(compute_device), {}) if int8 else None
+    vae_model._mgpu_attention_target = (torch.device(compute_device), {}, int8)
     if int8:
-        for module in vae_model.modules():
-            # ComfyUI's VAE attention blocks call the vae_attention() they store as optimized_attention.
-            if hasattr(module, "optimized_attention"):
-                module.optimized_attention = _run_vae_block_attention
-            _route_attention_to_compute(type(module).__module__)
+        _route_kitchen_int8_attention_to_compute()
+    for module in vae_model.modules():
+        # ComfyUI's VAE attention blocks call the vae_attention() they store as optimized_attention.
+        if hasattr(module, "optimized_attention"):
+            module.optimized_attention = _run_vae_block_attention
+        _route_attention_to_compute(type(module).__module__)
 
 
 def configure_hip_donor_gemm_offload(
@@ -2057,7 +2162,12 @@ def register_patched_safetensor_modelpatcher():
                     mixed_donor_device,
                 )
             if mixed_donor_device is not None and is_vae:
-                configure_mixed_vae(self.model, mixed_donor_device, device_to, mixed_int8)
+                configure_mixed_vae(
+                    self.model,
+                    mixed_donor_device,
+                    device_to,
+                    mixed_int8 or _has_int8_weights(self.model),
+                )
             elif mixed_donor_device is not None:
                 configure_mixed_execution(
                     self.model.diffusion_model, mixed_donor_device, device_to, schedule

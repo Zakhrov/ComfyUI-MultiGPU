@@ -302,7 +302,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
     def test_mixed_vae_runs_encode_and_decode_on_donor(self):
         calls = []
 
-        class VAEModel:
+        class VAEModel(torch.nn.Module):
             def encode(self, x, device=None):
                 calls.append(device)
                 return x * 2
@@ -330,7 +330,53 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertEqual(donor, torch.device("cuda:1"))
 
-    def test_mixed_int8_vae_runs_attention_on_compute_with_frames_as_heads(self):
+    def test_mixed_vae_runs_attention_on_compute_with_frames_as_heads(self):
+        self.check_mixed_int8_vae_attention(False, ((2, 4, 3, 3), "optimized"), ((1, 257, 2, 2), "pytorch"))
+
+    def test_mixed_int8_vae_routes_direct_kitchen_int8_attention_to_compute(self):
+        heads_seen = []
+
+        def int8_attention(q, k, v, *, scale=None, attn_mask=None):
+            heads_seen.append(q.shape[1])
+            return functional.scaled_dot_product_attention(q, k, v)
+
+        kitchen = types.ModuleType("comfy_kitchen")
+        kitchen.int8_attention = int8_attention
+
+        class VAEModel(torch.nn.Module):
+            def decode(self, q, k, v):
+                return kitchen.int8_attention(q, k, v)
+
+        model = VAEModel()
+        q, k, v = (torch.randn(1, 2, 5, 4) for _ in range(3))
+        with (
+            mock.patch.dict(sys.modules, {kitchen.__name__: kitchen}),
+            mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
+            mock.patch.object(self.distorch, "_int8_kitchen_attention", lambda func, device: func),
+        ):
+            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
+            output = model.decode(q, k, v)
+            outside = kitchen.int8_attention(q, k, v)
+
+        expected = functional.scaled_dot_product_attention(q, k, v)
+        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
+        self.assertTrue(torch.equal(outside, expected))
+        self.assertEqual(heads_seen, [1, 1, 2])
+
+    def test_int8_weights_are_detected_from_quant_format(self):
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+        algos = {"int8_tensorwise": {"storage_t": torch.int8}, "float8_e4m3fn": {"storage_t": torch.float8_e4m3fn}}
+        with mock.patch.object(sys.modules["comfy.quant_ops"], "QUANT_ALGOS", algos, create=True):
+            model[0].quant_format = "float8_e4m3fn"
+            self.assertFalse(self.distorch._has_int8_weights(model))
+            model[1].quant_format = "int8_tensorwise"
+            self.assertTrue(self.distorch._has_int8_weights(model))
+
+    def test_mixed_int8_vae_uses_kitchen_int8_attention_up_to_256_head_dim(self):
+        self.check_mixed_int8_vae_attention(True, ((2, 4, 3, 3), "int8"), ((1, 257, 2, 2), "pytorch"))
+
+    def check_mixed_int8_vae_attention(self, int8_available, *cases):
         calls = []
 
         def attention(name):
@@ -343,6 +389,11 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         attention_module = types.ModuleType("comfy.ldm.modules.attention")
         attention_module.optimized_attention = attention("optimized")
         attention_module.attention_pytorch = attention("pytorch")
+        attention_module.attention_comfy_kitchen_int8 = attention("int8")
+        attention_module.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = int8_available
+        kitchen = types.ModuleType("comfy_kitchen")
+        kitchen.int8_attention_is_available = lambda device: True
+        kitchen.int8_attention = lambda *_, **__: None
         class VAEModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -353,14 +404,18 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                 return self.block.optimized_attention(q, k, v)
 
         model = VAEModel()
-        self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
+        with mock.patch.dict(sys.modules, {kitchen.__name__: kitchen}):
+            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=int8_available)
 
         # Kitchen attention takes head dims up to 256; VAE heads span all channels.
-        for shape, name in (((2, 4, 3, 3), "optimized"), ((1, 257, 2, 2), "pytorch")):
+        for shape, name in cases:
             q, k, v = (torch.randn(shape) for _ in range(3))
             calls.clear()
             with (
-                mock.patch.dict(sys.modules, {attention_module.__name__: attention_module}),
+                mock.patch.dict(
+                    sys.modules,
+                    {attention_module.__name__: attention_module, kitchen.__name__: kitchen},
+                ),
                 mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
                 mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
             ):
@@ -381,6 +436,12 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         vae_module = types.ModuleType("mgpu_test_vae")
         vae_module.optimized_attention = attention
+        attention_module = types.ModuleType("comfy.ldm.modules.attention")
+        attention_module.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = False
+        attention_module.attention_comfy_kitchen_int8 = None
+        kitchen = types.ModuleType("comfy_kitchen")
+        kitchen.int8_attention_is_available = lambda device: True
+        kitchen.int8_attention = lambda *_, **__: None
 
         class VAEModel(torch.nn.Module):
             __module__ = vae_module.__name__
@@ -391,7 +452,14 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         model = VAEModel()
         q, k, v = (torch.randn(1, 2, 5, 4) for _ in range(3))
         with (
-            mock.patch.dict(sys.modules, {vae_module.__name__: vae_module}),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    vae_module.__name__: vae_module,
+                    attention_module.__name__: attention_module,
+                    kitchen.__name__: kitchen,
+                },
+            ),
             mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
             mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
         ):
@@ -661,6 +729,13 @@ class TestHipDonorGemmOffload(unittest.TestCase):
     def test_mixed_mode_requires_standard_linear_tiling(self):
         self.assertFalse(self.distorch.configure_mixed_gemm(DonorModule(), "cuda:0", "cuda:1"))
 
+    def test_token_chunks_are_whole_gemm_tiles(self):
+        chunks = self.distorch._token_chunks(4160, 1, 1 << 30)
+        self.assertEqual([chunk.stop - chunk.start for chunk in chunks], [512] * 8 + [64])
+        # Under one tile, or limited by the budget below it, the chunk size is kept.
+        self.assertEqual(len(self.distorch._token_chunks(100, 1, 1 << 30)), 8)
+        self.assertEqual(self.distorch._token_chunks(1000, 10, 3 * 10 * 100)[0], slice(0, 100))
+
     def test_mixed_quantized_linear_runs_its_own_forward_in_token_chunks(self):
         class QuantizedLinear(torch.nn.Linear):
             layout_type = "TensorWiseINT8Layout"
@@ -762,6 +837,48 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                     x = module(x)
 
         self.assertEqual(len(measured), 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")
+    def test_mixed_quantized_linears_stage_each_weight_once_per_forward(self):
+        class QuantizedLinear(torch.nn.Linear):
+            layout_type = "TensorWiseINT8Layout"
+
+        device = torch.device("cuda:0")
+        schedule = self.distorch._MixedSchedule(device, device)
+        linears = [QuantizedLinear(256, 256).requires_grad_(False) for _ in range(2)]
+        for module in linears:
+            self.distorch.configure_mixed_gemm(module, device, device, schedule=schedule)
+        weights = [(module.weight, module.bias) for module in linears]
+        x = torch.randn(64, 256, device=device)
+        expected = x
+        for module in linears:
+            expected = functional.linear(expected, module.weight.to(device), module.bias.to(device))
+        staged = []
+        stage_linear = self.distorch._stage_linear
+        measured = []
+
+        def counting_stage(*args, **kwargs):
+            staged.append(args[0])
+            return stage_linear(*args, **kwargs)
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30, create=True), \
+                mock.patch.object(self.distorch.mm, "module_size", lambda _: 256 * 256 * 4, create=True), \
+                mock.patch.object(self.distorch, "_stage_linear", counting_stage), \
+                mock.patch.object(self.distorch, "_compute_budget", lambda *_: measured.append(None) or 1 << 30):
+            for _ in range(2):
+                schedule.start_forward()
+                staged.clear()
+                output = x
+                for module in linears:
+                    output = module(output)
+                torch.cuda.synchronize(device)
+                self.assertTrue(torch.allclose(output, expected, atol=1e-3))
+
+        self.assertEqual(staged, linears)
+        self.assertEqual(len(measured), 2)
+        for module, (weight, bias) in zip(linears, weights):
+            self.assertIs(module.weight, weight)
+            self.assertIs(module.bias, bias)
 
     @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")
     def test_fused_mlp_runs_whole_on_compute(self):

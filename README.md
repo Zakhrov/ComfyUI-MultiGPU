@@ -80,7 +80,7 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
   - Reloading with the same LoRAs reuses the converted weights; changing LoRAs converts again.
   - Requantizing a GGUF weight adds a second rounding on top of its own quantization.
   - Plain LoRAs, linears whose input features aren't a multiple of 256, and convs run at full precision as in `mixed`.
-  - VAEs convert their linears too, and their attention runs on the compute GPU in chunks of frames or heads, with ComfyUI's selected attention (Comfy Kitchen) where the head dim is at most 256 and PyTorch SDPA otherwise. Everything else stays on the donor as in `mixed`. On the RX 5600M + Vega APU pair: MiniMax H3 decode 13.5 s → 4.8 s (17 frames, 256²), Flux encode 5.0 s → 3.7 s and decode 8.2 s → 6.9 s (1024², identical output), Wan 2.1 encode 36.9 s → 34.5 s (17 frames, 480×832).
+  - VAEs convert their linears too, and their attention (including MiniMax H3's direct Kitchen int8 attention for int8 weights) runs on the compute GPU in chunks of frames or heads, with ComfyUI's selected attention (Comfy Kitchen) where the head dim is at most 256 and PyTorch SDPA otherwise. Everything else stays on the donor as in `mixed`. On the RX 5600M + Vega APU pair: MiniMax H3 decode 13.5 s → 4.8 s (17 frames, 256²), Flux encode 5.0 s → 3.7 s and decode 8.2 s → 6.9 s (1024², identical output), Wan 2.1 encode 36.9 s → 34.5 s (17 frames, 480×832).
 
 - **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins the original CPU weights, since only donor GEMMs read host memory directly.
 
