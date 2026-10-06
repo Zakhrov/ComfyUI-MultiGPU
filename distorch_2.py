@@ -10,10 +10,12 @@ import functools
 import itertools
 import math
 import torch
+import torch.utils._pytree as pytree
 import logging
 import re
 import sys
 from collections import defaultdict, namedtuple
+from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
 logger = logging.getLogger("MultiGPU")
 import comfy.model_management as mm
@@ -79,6 +81,311 @@ def _current_device(device):
     """Make a CUDA device current, as Kitchen HIP kernels require; a no-op for others."""
     device = torch.device(device)
     return torch.cuda.device(device.index if device.type == "cuda" else -1)
+
+
+# Ops that only change tensor metadata or allocate, so they never launch a kernel.
+_METADATA_OPS = frozenset(
+    {
+        "aten::empty",
+        "aten::empty_like",
+        "aten::empty_strided",
+        "aten::new_empty",
+        "aten::new_empty_strided",
+        "aten::_unsafe_view",
+        "aten::resize_",
+        "aten::set_",
+        "aten::squeeze_",
+        "aten::unsqueeze_",
+        "aten::transpose_",
+        "aten::t_",
+        "aten::as_strided_",
+        "aten::lift_fresh",
+    }
+)
+# In-place ops that overwrite their target without reading it.
+_OVERWRITE_OPS = frozenset(
+    {"aten::zero_", "aten::fill_", "aten::random_", "aten::normal_", "aten::uniform_", "aten::bernoulli_"}
+)
+
+# Ops that copy elementwise without the pointwise tag.
+_COPY_OPS = frozenset({"aten::_to_copy", "aten::copy_", "aten::clone"})
+# An op on at most this many bytes of donor tensors hops whole without checking free VRAM.
+_STREAM_DIRECT_BYTES = 32 * 1024 * 1024
+# A tiled op moves slices of about this many bytes, enough to keep the copies busy.
+_STREAM_TILE_BYTES = 128 * 1024 * 1024
+
+
+def _int_list(value):
+    return [value] if isinstance(value, int) else list(value or ())
+
+
+def _tile_axes(func, args, kwargs, leaves):
+    """Axes an op can be split along, outermost first, as (extent, per-leaf dim or None, output dim).
+
+    Splitting an axis must give the same result as slicing every leaf along its
+    dim, running the op on each slice and joining the results along the output
+    dim. Returns an empty list for ops without a rule.
+    """
+    schema = func._schema
+    name = schema.name
+    ndim = leaves[0].ndim
+    shape = leaves[0].shape
+    rest = [None] * (len(leaves) - 1)
+
+    if name in ("aten::_softmax", "aten::_log_softmax"):
+        return [(shape[d], [d], d) for d in range(ndim) if d != args[1] % ndim and shape[d] > 1]
+    if name == "aten::native_layer_norm":
+        return [(shape[d], [d] + rest, d) for d in range(ndim - len(args[1])) if shape[d] > 1]
+    if name.startswith(("aten::upsample_", "aten::_upsample_")):
+        return [(shape[d], [d], d) for d in range(2) if shape[d] > 1]
+    if name == "aten::constant_pad_nd":
+        return [(shape[d], [d], d) for d in range(ndim - len(args[1]) // 2) if shape[d] > 1]
+    if name == "aten::addmm":
+        bias_dim = 0 if leaves[0].ndim == 2 and leaves[0].shape[0] == leaves[1].shape[0] else None
+        return [(leaves[1].shape[0], [bias_dim, 0, None], 0)]
+    if name == "aten::mm":
+        return [(shape[0], [0, None], 0)]
+    if name == "aten::bmm":
+        return [(shape[0], [0, 0], 0), (shape[1], [1, None], 1)]
+    if name in ("aten::cat", "aten::stack"):
+        stack = name == "aten::stack"
+        dim = kwargs.get("dim", args[1] if len(args) > 1 else 0) % (ndim + stack)
+        return [
+            (shape[d], [d] * len(leaves), d + (stack and d >= dim))
+            for d in range(ndim)
+            if shape[d] > 1 and (stack or d != dim)
+        ]
+    if torch.Tag.reduction in func.tags:
+        values = {
+            argument.name: args[i] if i < len(args) else kwargs.get(argument.name, argument.default_value)
+            for i, argument in enumerate(schema.arguments)
+            if argument.name in ("dim", "keepdim")
+        }
+        reduced = {d % ndim for d in _int_list(values.get("dim"))}
+        keepdim = values.get("keepdim", False)
+        return [
+            (shape[d], [d] + rest, d if keepdim else d - sum(r < d for r in reduced))
+            for d in range(ndim)
+            if reduced and d not in reduced and shape[d] > 1
+        ]
+    if torch.Tag.pointwise in func.tags or name in _COPY_OPS or name in _OVERWRITE_OPS:
+        broadcast = torch.broadcast_shapes(*[leaf.shape for leaf in leaves])
+        axes = []
+        for d, extent in enumerate(broadcast):
+            if extent > 1:
+                dims = [d - len(broadcast) + leaf.ndim for leaf in leaves]
+                axes.append((extent, [i if i >= 0 and leaf.shape[i] == extent else None for i, leaf in zip(dims, leaves)], d))
+        return axes
+    return []
+
+
+class _StreamedActivations(TorchDispatchMode):
+    """Keep activations on the donor GPU but run every op on the compute GPU.
+
+    An op with a donor tensor among its inputs copies them to the compute GPU,
+    runs there and copies its results back, so the donor only stores tensors
+    and does no math. Views, allocations and plain copies launch no kernel and
+    run in place. Code that is already on the compute GPU is unaffected.
+    """
+
+    def __init__(self, donor_device, compute_device):
+        super().__init__()
+        self.donor = torch.device(donor_device)
+        self.compute = torch.device(compute_device)
+        self.kinds = {}
+
+    def _kind(self, func):
+        kind = self.kinds.get(func)
+        if kind is None:
+            schema = func._schema
+            if schema.name in _METADATA_OPS:
+                kind = "metadata"
+            elif schema.is_mutable:
+                kind = "overwrite" if schema.name in _OVERWRITE_OPS else "mutating"
+            elif not any("Tensor" in str(r.type) for r in schema.returns) or any(
+                r.alias_info is not None for r in schema.returns
+            ):
+                kind = "metadata"
+            else:
+                kind = "plain"
+            self.kinds[func] = kind
+        return kind
+
+    def _to_compute(self, tensor, dtype=None):
+        if tensor.device != self.compute:
+            tensor = tensor.to(device=self.compute, non_blocking=True)
+        if dtype is not None and tensor.dtype != dtype:
+            tensor = tensor.to(dtype=dtype)
+        return tensor
+
+    def _resolve(self, device):
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return device
+
+    def _tiled(self, func, kind, args, kwargs, budget):
+        """Run an op on the compute GPU one slice at a time so that only a few slices are ever there.
+
+        The slices go through _pipeline_on_compute, and the results are joined on the donor.
+        """
+        name = func._schema.name
+        flat, spec = pytree.tree_flatten((args, kwargs))
+        positions = [i for i, value in enumerate(flat) if isinstance(value, torch.Tensor)]
+        leaves = [flat[i] for i in positions]
+        mutating = kind != "plain"
+        axes = [axis for axis in _tile_axes(func, args, kwargs, leaves) if not mutating or axis[1][0] is not None]
+        if not axes:
+            raise torch.OutOfMemoryError(
+                f"{name} on {sum(leaf.nbytes for leaf in leaves) >> 20} MiB of activations does not fit on "
+                f"{self.compute} and has no tiling rule"
+            )
+
+        def rows_that_fit(axis):
+            extent, dims, _ = axis
+            sliced = max(leaf.nbytes for leaf, dim in zip(leaves, dims) if dim is not None)
+            whole = sum(leaf.nbytes for leaf, dim in zip(leaves, dims) if dim is None)
+            # Slices of the inputs and results, three of which are on the compute GPU at once.
+            fit = (budget - whole) * extent // (3 * 2 * sliced)
+            return min(fit, _STREAM_TILE_BYTES * extent // sliced)
+
+        fitting = [axis for axis in axes if rows_that_fit(axis) >= 1]
+        extent, dims, out_dim = fitting[0] if fitting else max(axes)
+        rows = max(1, min(rows_that_fit((extent, dims, out_dim)), extent))
+        whole = {
+            index: leaf.to(device=self.compute, non_blocking=True) if leaf.device == self.donor else leaf
+            for index, (leaf, dim) in enumerate(zip(leaves, dims))
+            if dim is None
+        }
+        outputs = [leaves[0]] if mutating else []
+        progress = [0]
+
+        def load(chunk):
+            start, stop = chunk
+            tiles = []
+            for index, (leaf, dim) in enumerate(zip(leaves, dims)):
+                if dim is None:
+                    tiles.append(whole[index])
+                    continue
+                tile = leaf.narrow(dim, start, stop - start)
+                if tile.device == self.donor:
+                    if kind == "overwrite" and index == 0:
+                        tile = torch.empty_like(tile, device=self.compute)
+                    else:
+                        tile = tile.to(device=self.compute, non_blocking=True)
+                tiles.append(tile)
+            return tuple(tiles)
+
+        def run(tiles):
+            values = list(flat)
+            for position, tile in zip(positions, tiles):
+                values[position] = tile
+            tile_args, tile_kwargs = pytree.tree_unflatten(values, spec)
+            return func(*tile_args, **tile_kwargs)
+
+        def store(chunk, result):
+            start, stop = chunk
+            results = result if isinstance(result, tuple) else (result,)
+            if not outputs:
+                for tile in results:
+                    shape = list(tile.shape)
+                    shape[out_dim] = extent
+                    outputs.append(torch.empty(shape, dtype=tile.dtype, device=self.donor))
+            for output, tile in zip(outputs, results):
+                output.narrow(dims[0] if mutating else out_dim, start, stop - start).copy_(tile, non_blocking=True)
+            progress[0] = stop
+
+        while progress[0] < extent:
+            chunks = [(start, min(start + rows, extent)) for start in range(progress[0], extent, rows)]
+            try:
+                _pipeline_on_compute(chunks, self.compute, load, run, store)
+            except torch.OutOfMemoryError:
+                if rows == 1:
+                    raise
+                rows //= 2
+                if self.compute.type == "cuda":
+                    torch.cuda.synchronize(self.compute)
+                torch.cuda.empty_cache()
+        if self.compute.type == "cuda":
+            torch.cuda.synchronize(self.compute)
+        if mutating:
+            return args[0]
+        return tuple(outputs) if len(outputs) > 1 else outputs[0]
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        kind = self._kind(func)
+        if kind == "metadata":
+            return func(*args, **kwargs)
+        target = kwargs.get("device")
+        target = None if target is None else self._resolve(target)
+        tensors = [leaf for leaf in pytree.tree_leaves((args, kwargs)) if isinstance(leaf, torch.Tensor)]
+        if target != self.donor and not any(tensor.device == self.donor for tensor in tensors):
+            return func(*args, **kwargs)
+
+        name = func._schema.name
+        donor_bytes = sum(tensor.nbytes for tensor in tensors if tensor.device == self.donor)
+        if (
+            donor_bytes > _STREAM_DIRECT_BYTES
+            and target in (None, self.donor)
+            and (name != "aten::copy_" or all(tensor.device == self.donor for tensor in args[:2]))
+            and (name != "aten::_to_copy" or args[0].device == self.donor)
+        ):
+            budget = mm.get_free_memory(self.compute) - _COMPUTE_GPU_RESERVE_BYTES
+            if 3 * donor_bytes > budget:
+                return self._tiled(func, kind, args, kwargs, budget)
+
+        if name == "aten::copy_":
+            dst, src = args[0], args[1]
+            if dst.device == self.donor or src.device == self.donor:
+                if src.device == self.donor or src.dtype != dst.dtype:
+                    src = self._to_compute(src, dst.dtype)
+                return func(dst, src, *args[2:], **kwargs)
+        elif name == "aten::_to_copy":
+            src = args[0]
+            dtype = kwargs.get("dtype")
+            if (dtype is None or dtype == src.dtype) and target is not None and target != src.device:
+                return func(*args, **kwargs)
+            result = self._to_compute(src, dtype)
+            destination = src.device if target is None else target
+            return result if destination == self.compute else result.to(device=destination, non_blocking=True)
+
+        moved = {}
+
+        def to_compute(tensor):
+            if tensor.device != self.donor:
+                return tensor
+            if id(tensor) not in moved:
+                if kind == "overwrite" and tensor is args[0]:
+                    moved[id(tensor)] = torch.empty_like(tensor, device=self.compute)
+                else:
+                    moved[id(tensor)] = self._to_compute(tensor)
+            return moved[id(tensor)]
+
+        compute_args, compute_kwargs = pytree.tree_map_only(torch.Tensor, to_compute, (args, kwargs))
+        if target == self.donor:
+            compute_kwargs["device"] = self.compute
+        result = func(*compute_args, **compute_kwargs)
+
+        originals = {}
+        if kind != "plain":
+            for index, argument in enumerate(func._schema.arguments):
+                if argument.alias_info is None or not argument.alias_info.is_write:
+                    continue
+                value = args[index] if index < len(args) else kwargs.get(argument.name)
+                for tensor in pytree.tree_leaves(value):
+                    if isinstance(tensor, torch.Tensor) and tensor.device == self.donor:
+                        tensor.copy_(moved[id(tensor)], non_blocking=True)
+                        originals[id(moved[id(tensor)])] = tensor
+        if target is not None and target != self.donor:
+            return result
+
+        def to_donor(tensor):
+            if id(tensor) in originals:
+                return originals[id(tensor)]
+            return tensor.to(device=self.donor, non_blocking=True) if tensor.device == self.compute else tensor
+
+        return pytree.tree_map_only(torch.Tensor, to_donor, result)
 
 
 def _is_hip_software_gemm_device(device):
@@ -153,6 +460,21 @@ def _compute_budget(compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
     return max(0, mm.get_free_memory(compute_device) - reserve)
 
 
+_PIPELINE_STREAMS = {}
+
+
+def _without_streaming(function):
+    """Run function with _StreamedActivations paused: its tensors are already where it computes."""
+
+    @functools.wraps(function)
+    def run(*args, **kwargs):
+        with _disable_current_modes():
+            return function(*args, **kwargs)
+
+    return run
+
+
+@_without_streaming
 def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
     """Run chunks on the compute GPU with their copies overlapping the compute.
 
@@ -171,7 +493,10 @@ def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
                 during()
         return
     compute_stream = torch.cuda.current_stream(compute_device)
-    copy_stream = torch.cuda.Stream(compute_device)
+    # One stream per device: the allocator cannot reuse a stream's cached blocks for another stream.
+    if compute_device not in _PIPELINE_STREAMS:
+        _PIPELINE_STREAMS[compute_device] = torch.cuda.Stream(compute_device)
+    copy_stream = _PIPELINE_STREAMS[compute_device]
 
     def load_on_copy_stream(chunk):
         with torch.cuda.stream(copy_stream):
@@ -193,7 +518,8 @@ def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
         copy_stream.wait_event(compute_stream.record_event())
         with torch.cuda.stream(copy_stream):
             store(chunk, result)
-        result.record_stream(copy_stream)
+        for tensor in result if isinstance(result, tuple) else (result,):
+            tensor.record_stream(copy_stream)
         in_flight.append(copy_stream.record_event())
         if len(in_flight) > 2:
             in_flight.pop(0).synchronize()
@@ -264,7 +590,7 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
     budget = _compute_budget(compute_device)
 
     if isinstance(bias, torch.Tensor):
-        bias = bias.to(device=compute_device)
+        bias = bias.to(device=compute_device, non_blocking=True)
 
     # Keep the whole weight on the compute GPU when it takes at most half the
     # budget; otherwise stream output-channel tiles for every token chunk.
@@ -275,7 +601,7 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
         _run_linear_chunks(
             flat_input,
             output,
-            weight.to(device=compute_device),
+            weight.to(device=compute_device, non_blocking=True),
             bias,
             lora_down,
             lora_up,
@@ -310,14 +636,14 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
         for token_start in range(0, tokens, tokens_per_chunk):
             token_end = min(token_start + tokens_per_chunk, tokens)
             input_chunk = input_buffer[: token_end - token_start]
-            input_chunk.copy_(flat_input[token_start:token_end])
+            input_chunk.copy_(flat_input[token_start:token_end], non_blocking=True)
             if lora_down is not None:
                 lora_chunk = lora_buffer[: input_chunk.shape[0]]
                 torch.mm(input_chunk, lora_down.t(), out=lora_chunk)
             for start in range(0, out_features, rows_per_tile):
                 end = min(start + rows_per_tile, out_features)
                 weight_tile = weight_buffer[: end - start]
-                weight_tile.copy_(weight[start:end])
+                weight_tile.copy_(weight[start:end], non_blocking=True)
                 output_tile = output_buffer[: input_chunk.shape[0] * (end - start)].view(
                     input_chunk.shape[0], end - start
                 )
@@ -327,7 +653,7 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
                     torch.addmm(bias[start:end], input_chunk, weight_tile.t(), out=output_tile)
                 if lora_down is not None:
                     output_tile.addmm_(lora_chunk, lora_up[start:end].t())
-                output[token_start:token_end, start:end].copy_(output_tile)
+                output[token_start:token_end, start:end].copy_(output_tile, non_blocking=True)
 
     return output.reshape(*input_tensor.shape[:-1], out_features)
 
@@ -394,10 +720,10 @@ def _run_tiled_conv_on_compute(
         input_numel *= input_extent(chunk, dim)
     input_buffer = torch.empty(input_numel, device=compute_device, dtype=output.dtype)
     if isinstance(bias, torch.Tensor):
-        bias = bias.to(device=compute_device)
+        bias = bias.to(device=compute_device, non_blocking=True)
     resident = channels_per_tile == out_channels
     if resident:
-        weight_buffer.copy_(weight)
+        weight_buffer.copy_(weight, non_blocking=True)
     conv = torch.nn.functional.conv3d if dims == 3 else torch.nn.functional.conv2d
     tile_starts = [range(0, out_size[dim], chunk[dim]) for dim in range(dims)]
 
@@ -425,7 +751,7 @@ def _run_tiled_conv_on_compute(
                     input_tile[tuple(edge)].zero_()
                     edge[dim + 2] = slice(filled, None)
                     input_tile[tuple(edge)].zero_()
-                input_tile[tuple(interior)].copy_(input_tensor[tuple(source)])
+                input_tile[tuple(interior)].copy_(input_tensor[tuple(source)], non_blocking=True)
                 target = [slice(sample, sample + 1), None] + [
                     slice(start, end) for start, end in zip(starts, ends)
                 ]
@@ -433,18 +759,16 @@ def _run_tiled_conv_on_compute(
                     end = min(start + channels_per_tile, out_channels)
                     weight_tile = weight_buffer[: end - start]
                     if not resident:
-                        weight_tile.copy_(weight[start:end])
+                        weight_tile.copy_(weight[start:end], non_blocking=True)
                     target[1] = slice(start, end)
-                    output[tuple(target)].copy_(
-                        conv(
+                    output[tuple(target)].copy_(conv(
                             input_tile,
                             weight_tile,
                             None if bias is None else bias[start:end],
                             stride,
                             0,
                             dilation,
-                        )
-                    )
+                        ), non_blocking=True)
 
     return output
 
@@ -459,10 +783,10 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
     each other's attention, and three fit half the free VRAM. On OOM the call
     restarts with half the heads, then half the queries, and plan keeps the
     result for later calls. When one head group and one query still do not
-    fit, attention runs on the donor.
+    fit, attention fails with an out-of-memory error.
     """
     key = (q.shape, k.shape)
-    if mask is not None or plan.get(key, True) is None:
+    if mask is not None:
         return func(q, k, v, heads, mask, *args, **kwargs)
 
     skip_reshape = kwargs.get("skip_reshape", False)
@@ -498,13 +822,9 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
     def load(part):
         head, count, start, length = part
         return (
-            head_slice(q, head, count, heads, not skip_reshape)
-            .narrow(seq_dim, start, length)
-            .to(device=compute_device, non_blocking=True),
-            head_slice(k, head // group, count // group, kv_heads, not skip_reshape)
-            .to(device=compute_device, non_blocking=True),
-            head_slice(v, head // group, count // group, kv_heads, not skip_reshape)
-            .to(device=compute_device, non_blocking=True),
+            head_slice(q, head, count, heads, not skip_reshape).narrow(seq_dim, start, length).to(device=compute_device, non_blocking=True),
+            head_slice(k, head // group, count // group, kv_heads, not skip_reshape).to(device=compute_device, non_blocking=True),
+            head_slice(v, head // group, count // group, kv_heads, not skip_reshape).to(device=compute_device, non_blocking=True),
         )
 
     def run(inputs):
@@ -521,9 +841,7 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
             head_axis = 1 if skip_output_reshape else -1
             shape[head_axis] = shape[head_axis] // count * heads
             output = torch.empty(shape, device=q.device, dtype=result.dtype)
-        head_slice(output, head, count, heads, not skip_output_reshape).narrow(
-            out_seq_dim, start, length
-        ).copy_(result, non_blocking=True)
+        head_slice(output, head, count, heads, not skip_output_reshape).narrow(out_seq_dim, start, length).copy_(result, non_blocking=True)
 
     while True:
         parts = [
@@ -546,19 +864,16 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
         elif chunk[1] > 1:
             chunk[1] = max(1, chunk[1] // 2)
         else:
-            plan[key] = None
-            logger.info(
-                "[MultiGPU DisTorch V2] Attention does not fit on %s; running it on the donor",
-                compute_device,
+            raise torch.OutOfMemoryError(
+                f"Attention does not fit on {compute_device} for one head group and one query"
             )
-            return func(q, k, v, heads, None, *args, **kwargs)
 
 
-def _materialize_linear_on_donor(module, dtype, donor_device):
-    """Apply ComfyUI weight casts and patches on the donor before transfer."""
+def _materialize_linear(module, dtype, device):
+    """Apply ComfyUI weight casts and patches on the given device."""
     module_cast_bias_weight = getattr(module, "cast_bias_weight", None)
     if callable(module_cast_bias_weight):
-        weight, bias = module_cast_bias_weight(dtype=dtype, device=donor_device)
+        weight, bias = module_cast_bias_weight(dtype=dtype, device=device)
         return weight, bias, None
 
     needs_materialization = (
@@ -567,10 +882,10 @@ def _materialize_linear_on_donor(module, dtype, donor_device):
         or bool(getattr(module, "bias_function", ()))
     )
     if not needs_materialization:
-        weight = module.weight.to(device=donor_device, dtype=dtype)
+        weight = module.weight.to(device=device, dtype=dtype)
         bias = getattr(module, "bias", None)
         if isinstance(bias, torch.Tensor):
-            bias = bias.to(device=donor_device, dtype=dtype)
+            bias = bias.to(device=device, dtype=dtype)
         return weight, bias, None
 
     from comfy.ops import cast_bias_weight
@@ -578,15 +893,15 @@ def _materialize_linear_on_donor(module, dtype, donor_device):
     weight, bias, offload_state = cast_bias_weight(
         module,
         dtype=dtype,
-        device=donor_device,
+        device=device,
         bias_dtype=dtype,
         offloadable=True,
     )
     return weight, bias, offload_state
 
 
-def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
-    """Confirm once that the donor materialized the weight before compute transfer."""
+def _log_weight_preparation(module, device, weight, used_comfy_cast):
+    """Confirm once where a weight was materialized."""
     if getattr(module, "_mgpu_donor_preparation_logged", False):
         return
 
@@ -601,9 +916,9 @@ def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
         operations.append("bias patches")
 
     logger.info(
-        "[MultiGPU DisTorch V2] Donor preparation confirmed on %s: %s; "
-        "prepared weight is on %s (%s, %.2f MiB) before compute-GPU GEMM",
-        donor_device,
+        "[MultiGPU DisTorch V2] Weight preparation confirmed on %s: %s; "
+        "prepared weight is on %s (%s, %.2f MiB) for the compute-GPU GEMM",
+        device,
         ", ".join(operations),
         weight.device,
         weight.dtype,
@@ -615,7 +930,7 @@ def _log_donor_preparation(module, donor_device, weight, used_comfy_cast):
 def _plain_lora_patches(patches):
     """ComfyUI weight patches as (down, up, scale), or () to merge them as usual.
 
-    Merging a LoRA costs a full-size GEMM on the donor. Plain LoRAs are
+    Merging a LoRA costs a full-size GEMM. Plain LoRAs are
     instead applied as two thin GEMMs on the compute GPU.
     """
     if not patches:
@@ -669,7 +984,7 @@ def _prepare_mixed_int8_weight(module, name, patches, dtype, donor_device, key):
     bias_patches = patches.get(f"{name}.bias", ())
     lora = _plain_lora_patches(weight_patches)
     with _current_device(donor_device):
-        weight, bias, offload_state = _materialize_linear_on_donor(module, dtype, donor_device)
+        weight, bias, offload_state = _materialize_linear(module, dtype, donor_device)
         try:
             if weight_patches and not lora:
                 weight = calculate_weight(weight_patches, weight.float(), f"{name}.weight")
@@ -695,6 +1010,7 @@ def _prepare_mixed_int8_weight(module, name, patches, dtype, donor_device, key):
     module._mgpu_int8_key = key
 
 
+@_without_streaming
 def _prepare_linear_on_donor(module, dtype, donor_device):
     """Materialize a linear's weight on the donor; returns (weight, bias, offload_state, lora).
 
@@ -715,13 +1031,11 @@ def _prepare_linear_on_donor(module, dtype, donor_device):
         module.weight.patches = []
     try:
         with _current_device(donor_device):
-            weight, bias, offload_state = _materialize_linear_on_donor(
-                module, dtype, donor_device
-            )
+            weight, bias, offload_state = _materialize_linear(module, dtype, donor_device)
     finally:
         if lora:
             module.weight.patches = patches
-    _log_donor_preparation(module, donor_device, weight, used_comfy_cast)
+    _log_weight_preparation(module, donor_device, weight, used_comfy_cast)
     return weight, bias, offload_state, lora
 
 
@@ -843,7 +1157,7 @@ def _stage_linear(module, dtype, schedule=None):
     """Put a mixed linear's GEMM weight on the compute GPU, on the schedule's streams if given.
 
     A quantized linear and mixed_int8 send their stored weight; mixed prepares the
-    weight on the donor first. Returns None for a prepared weight larger than half
+    weight on the donor. Returns None for a prepared weight larger than half
     the compute GPU's free memory, which streams in tiles instead.
     """
     compute_device = module._mgpu_compute_device
@@ -1271,12 +1585,11 @@ def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=F
 
 
 def configure_mixed_execution(diffusion_model, donor_device, compute_device, schedule):
-    """Run the diffusion model on the donor and send attention to the compute GPU.
+    """Keep the diffusion model's activations on the donor and run all compute on the compute GPU.
 
-    Activations, norms, modulation, rope and weight preparation stay on the
-    donor. Linears and convs (see configure_mixed_gemm), token-wise MLPs (see
-    _run_fused_mlp) and attention run on the compute GPU in tiles sized to its
-    free VRAM.
+    Every op that touches a donor tensor is streamed to the compute GPU (see
+    _StreamedActivations); linears and convs (see configure_mixed_gemm), token-wise
+    MLPs (see _run_fused_mlp) and attention run there in tiles sized to its free VRAM.
     """
     if not hasattr(diffusion_model, "_mgpu_original_forward"):
         diffusion_model._mgpu_original_forward = diffusion_model.forward
@@ -1302,7 +1615,7 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
 
             transformer_options["optimized_attention_override"] = attention_on_compute
             donor_args = _move_tensors(args, donor)
-            with torch.cuda.device_of(_first_tensor(donor_args)):
+            with _StreamedActivations(donor, compute), _current_device(compute):
                 output = diffusion_model._mgpu_original_forward(
                     *donor_args,
                     transformer_options=transformer_options,
@@ -1312,7 +1625,7 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
 
         diffusion_model.forward = mixed_forward
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed execution: activations on %s, GEMMs and attention on %s",
+            "[MultiGPU DisTorch V2] Mixed execution: activations on %s, all compute on %s",
             donor_device,
             compute_device,
         )
@@ -1477,6 +1790,7 @@ def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
         def donor_call(method):
             def mixed_call(*args, **kwargs):
                 donor = vae_model._mgpu_donor_execution_device
+                compute = vae_model._mgpu_compute_device
                 output_device = _first_tensor(args).device
                 # Chunked-IO VAEs write straight into output_buffer and move
                 # their own chunks to the given device.
@@ -1489,7 +1803,7 @@ def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
                 donor_args = _move_tensors(args, donor)
                 token = _vae_attention_target.set(vae_model._mgpu_attention_target)
                 try:
-                    with torch.cuda.device_of(_first_tensor(donor_args)):
+                    with _StreamedActivations(donor, compute), _current_device(compute):
                         output = method(*donor_args, **donor_kwargs)
                 finally:
                     _vae_attention_target.reset(token)
@@ -1505,7 +1819,7 @@ def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
                 vae_model._mgpu_original_methods[name] = method
                 setattr(vae_model, name, donor_call(method))
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, GEMMs and attention on %s",
+            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, all compute on %s",
             donor_device,
             compute_device,
         )

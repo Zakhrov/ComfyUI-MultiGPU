@@ -742,6 +742,10 @@ _patch_comfy_sample_runtime_device()
 _patch_comfy_kitchen_dlpack_device_guard()
 _initialize_aimdo_visible_cuda_devices()
 
+from .miopen_conv3d_guard import register_miopen_conv3d_guard
+
+register_miopen_conv3d_guard()
+
 from .nodes import (
     DeviceSelectorMultiGPU,
     UnetLoaderGGUF,

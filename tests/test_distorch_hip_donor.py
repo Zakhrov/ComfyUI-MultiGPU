@@ -540,30 +540,88 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         chunk_heads, chunk_tokens = plan[(q.shape, k.shape)]
         self.assertEqual((chunk_heads, chunk_tokens), (1, 4))
 
-    def test_attention_falls_back_to_donor_when_nothing_fits(self):
-        q, k, v = (torch.randn(1, 2, 4, 3) for _ in range(3))
-        plan = {}
-        donor_calls = []
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_streamed_activations_stay_on_donor_and_match_cpu(self):
+        donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
+        x = torch.randn(4, 8, device=donor)
+        with self.distorch._StreamedActivations(donor, compute):
+            y = (functional.layer_norm(x, (8,)) * 2 + 1).transpose(0, 1).contiguous()
+            y.add_(1)
+            y[0] = 5
+            filled = torch.empty(3, device=donor).fill_(2)
+        expected = (functional.layer_norm(x.cpu(), (8,)) * 2 + 1).transpose(0, 1) + 1
+        expected[0] = 5
+        self.assertEqual((y.device, filled.device), (donor, donor))
+        self.assertTrue(torch.allclose(y.cpu(), expected, atol=1e-5))
+        self.assertTrue(torch.equal(filled.cpu(), torch.full((3,), 2.0)))
 
-        def attention(q_in, k_in, v_in, heads, mask=None, **kwargs):
-            # Chunks are views, so only the donor fallback sees the original tensors.
-            if q_in is not q:
-                raise torch.OutOfMemoryError("out of memory")
-            donor_calls.append(q_in.shape)
-            return functional.scaled_dot_product_attention(q_in, k_in, v_in)
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_streamed_activations_tile_ops_that_do_not_fit(self):
+        donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
+        x, y, v = torch.randn(6, 40, 32), torch.randn(1, 40, 32), torch.randn(32)
+
+        def run(x, y, v):
+            shifted = x.clone()
+            shifted.mul_(y).add_(v)
+            return [
+                functional.silu(x) * y + v,
+                shifted,
+                x.softmax(1),
+                functional.layer_norm(x, (32,), v, v),
+                x.pow(2).mean(-1, keepdim=True),
+                x.sum(dim=1),
+                torch.cat([x, y.expand_as(x)], dim=1),
+                torch.bmm(x, x.transpose(1, 2)),
+                x.to(torch.float16),
+                functional.pad(x, (1, 2, 0, 1)),
+            ]
+
+        expected = run(x, y, v)
+        tiled = []
+        original = self.distorch._StreamedActivations._tiled
+
+        def spy(mode, func, *args):
+            tiled.append(func._schema.name)
+            return original(mode, func, *args)
+
+        with (
+            mock.patch.object(self.distorch, "_STREAM_DIRECT_BYTES", 1000),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: self.distorch._COMPUTE_GPU_RESERVE_BYTES + 60000),
+            mock.patch.object(self.distorch._StreamedActivations, "_tiled", spy),
+            self.distorch._StreamedActivations(donor, compute),
+        ):
+            actual = run(x.to(donor), y.to(donor), v.to(donor))
+
+        for output, reference in zip(actual, expected):
+            self.assertEqual(output.device, donor)
+            self.assertTrue(torch.allclose(output.cpu().float(), reference.float(), atol=1e-4, rtol=1e-4))
+        self.assertTrue({"aten::_softmax", "aten::native_layer_norm", "aten::bmm", "aten::cat", "aten::mean", "aten::mul_"} <= set(tiled))
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_streamed_activations_report_ops_that_cannot_be_tiled(self):
+        donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
+        x = torch.randn(4, 64, device=donor)
+        with (
+            mock.patch.object(self.distorch, "_STREAM_DIRECT_BYTES", 100),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: self.distorch._COMPUTE_GPU_RESERVE_BYTES),
+            self.distorch._StreamedActivations(donor, compute),
+            self.assertRaisesRegex(torch.OutOfMemoryError, "no tiling rule"),
+        ):
+            x.sort(dim=-1)
+
+    def test_attention_raises_out_of_memory_when_nothing_fits(self):
+        q, k, v = (torch.randn(1, 2, 4, 3) for _ in range(3))
+
+        def attention(*args, **kwargs):
+            raise torch.OutOfMemoryError("out of memory")
 
         with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30):
-            for _ in range(2):
-                output = self.distorch._run_attention_on_compute(
-                    attention, q, k, v, 2, compute_device=torch.device("cpu"), plan=plan,
+            with self.assertRaises(torch.OutOfMemoryError):
+                self.distorch._run_attention_on_compute(
+                    attention, q, k, v, 2, compute_device=torch.device("cpu"), plan={},
                     skip_reshape=True, skip_output_reshape=True,
                 )
 
-        self.assertTrue(
-            torch.allclose(output, functional.scaled_dot_product_attention(q, k, v), atol=1e-6)
-        )
-        self.assertIsNone(plan[(q.shape, k.shape)])
-        self.assertEqual(donor_calls[-2:], [q.shape, q.shape])
 
     def test_mixed_execution_moves_model_to_donor_and_routes_attention(self):
         calls = []
@@ -599,7 +657,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output, module(input_tensor)))
         self.assertEqual(output.shape, (2, 5))
-        self.assertIn("Donor preparation confirmed on cpu", logs.output[0])
+        self.assertIn("Weight preparation confirmed on cpu", logs.output[0])
         self.assertIn("prepared weight is on cpu", logs.output[0])
 
     def test_materializes_cast_weights_on_donor(self):
