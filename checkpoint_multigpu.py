@@ -195,12 +195,7 @@ def patched_load_state_dict_guess_config(
                 if unet_alloc:
                     register_patched_safetensor_modelpatcher()
                     inner_model = model_patcher.model
-                    inner_model._distorch_v2_meta = {
-                        "full_allocation": unet_alloc,
-                        "donor_gemm_execution_mode": distorch_config.get(
-                            "donor_gemm_execution_mode", "disabled"
-                        ),
-                    }
+                    inner_model._distorch_v2_meta = {"full_allocation": unet_alloc}
                     logger.info(
                         f"[CHECKPOINT_META] UNET inner_model id=0x{id(inner_model):x}"
                     )
@@ -276,12 +271,7 @@ def patched_load_state_dict_guess_config(
                         if clip_alloc and hasattr(clip, "patcher"):
                             register_patched_safetensor_modelpatcher()
                             inner_clip = clip.patcher.model
-                            inner_clip._distorch_v2_meta = {
-                                "full_allocation": clip_alloc,
-                                "donor_gemm_execution_mode": distorch_config.get(
-                                    "donor_gemm_execution_mode", "disabled"
-                                ),
-                            }
+                            inner_clip._distorch_v2_meta = {"full_allocation": clip_alloc}
                             logger.info(
                                 f"[CHECKPOINT_META] CLIP inner_model id=0x{id(inner_clip):x}"
                             )
@@ -368,13 +358,6 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
                     {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
                 ),
                 "unet_donor_device": (devices, {"default": "cpu"}),
-                "donor_gemm_execution_mode": (
-                    ["disabled", "mixed", "mixed_int8", "all"],
-                    {
-                        "default": "disabled",
-                        "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; mixed_int8 also requantizes prepared weights to int8 for Comfy Kitchen int8 GEMMs; all runs every eligible GEMM on the donor.",
-                    },
-                ),
                 "clip_compute_device": (devices, {"default": "cpu"}),
                 "clip_virtual_vram_gb": (
                     "FLOAT",
@@ -408,7 +391,6 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
         unet_compute_device,
         unet_virtual_vram_gb,
         unet_donor_device,
-        donor_gemm_execution_mode,
         clip_compute_device,
         clip_virtual_vram_gb,
         clip_donor_device,
@@ -492,12 +474,11 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
             "unet_allocation": unet_alloc,
             "clip_allocation": clip_alloc,
             "high_precision_loras": high_precision_loras,
-            "donor_gemm_execution_mode": donor_gemm_execution_mode,
             "unet_settings": hashlib.sha256(
-                f"{unet_alloc}{donor_gemm_execution_mode}{high_precision_loras}".encode()
+                f"{unet_alloc}{high_precision_loras}".encode()
             ).hexdigest(),
             "clip_settings": hashlib.sha256(
-                f"{clip_alloc}{donor_gemm_execution_mode}{high_precision_loras}".encode()
+                f"{clip_alloc}{high_precision_loras}".encode()
             ).hexdigest(),
         }
 

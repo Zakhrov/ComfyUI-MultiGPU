@@ -186,7 +186,7 @@ def _tile_axes(func, args, kwargs, leaves):
 
 
 class _StreamedActivations(TorchDispatchMode):
-    """Keep activations on the donor GPU but run every op on the compute GPU.
+    """Keep activations on the donor but run every op on the compute GPU.
 
     An op with a donor tensor among its inputs copies them to the compute GPU,
     runs there and copies its results back, so the donor only stores tensors
@@ -198,6 +198,8 @@ class _StreamedActivations(TorchDispatchMode):
         super().__init__()
         self.donor = torch.device(donor_device)
         self.compute = torch.device(compute_device)
+        # A non-blocking copy to the CPU returns before its data has arrived.
+        self.async_to_donor = self.donor.type != "cpu"
         self.kinds = {}
 
     def _kind(self, func):
@@ -363,7 +365,9 @@ class _StreamedActivations(TorchDispatchMode):
                 return func(*args, **kwargs)
             result = self._to_compute(src, dtype)
             destination = src.device if target is None else target
-            return result if destination == self.compute else result.to(device=destination, non_blocking=True)
+            if destination == self.compute:
+                return result
+            return result.to(device=destination, non_blocking=destination != self.donor or self.async_to_donor)
 
         moved = {}
 
@@ -398,7 +402,7 @@ class _StreamedActivations(TorchDispatchMode):
         def to_donor(tensor):
             if id(tensor) in originals:
                 return originals[id(tensor)]
-            return tensor.to(device=self.donor, non_blocking=True) if tensor.device == self.compute else tensor
+            return tensor.to(device=self.donor, non_blocking=self.async_to_donor) if tensor.device == self.compute else tensor
 
         return pytree.tree_map_only(torch.Tensor, to_donor, result)
 
@@ -449,17 +453,6 @@ def _can_tile_conv_on_compute(module):
         and module.groups == 1
         and not isinstance(module.padding, str)
     )
-
-
-def _donor_gemm_skip_reasons(compute_device, donor_device):
-    reasons = []
-    if donor_device == compute_device:
-        reasons.append("donor and compute devices are the same")
-    if not _is_hip_software_gemm_device(compute_device):
-        reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
-    if not _is_hip_software_gemm_device(donor_device):
-        reasons.append(f"donor device {donor_device} lacks HIP software GEMM")
-    return reasons
 
 
 def _compute_budget(compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
@@ -968,62 +961,6 @@ def _plain_lora_patches(patches):
     return lora
 
 
-def _is_mixed_int8_linear(module):
-    """Whether mixed_int8 stores a linear as int8 ConvRot, which rotates 256-wide input groups."""
-    return (
-        _is_eligible_donor_gemm(module)
-        and _can_tile_linear_on_compute(module)
-        and getattr(module, "layout_type", None) is None
-        and module.in_features % 256 == 0
-    )
-
-
-def _prepare_mixed_int8_weight(module, name, patches, dtype, donor_device, key):
-    """Quantize a mixed_int8 linear to int8 ConvRot once, at load, and keep it in system RAM.
-
-    The donor quantizes one layer at a time and keeps only activations; the
-    compute GPU reads the int8 weight from RAM as fast as from the donor, since
-    PCIe limits both. The original weight is neither moved nor copied, so a
-    memory-mapped GGUF stays on disk. Plain LoRAs stay low-rank GEMMs for the
-    compute GPU; other patches are merged before quantizing. A reload with the
-    same patches (key) reuses the int8 weight.
-    """
-    if getattr(module, "_mgpu_int8_key", None) == key:
-        return
-
-    from comfy.lora import calculate_weight
-    from comfy.quant_ops import QuantizedTensor
-
-    weight_patches = patches.get(f"{name}.weight", ())
-    bias_patches = patches.get(f"{name}.bias", ())
-    lora = _plain_lora_patches(weight_patches)
-    with _current_device(donor_device):
-        weight, bias, offload_state = _materialize_linear(module, dtype, donor_device)
-        try:
-            if weight_patches and not lora:
-                weight = calculate_weight(weight_patches, weight.float(), f"{name}.weight")
-            if bias is not None and bias_patches:
-                bias = calculate_weight(bias_patches, bias.float(), f"{name}.bias")
-            quantized = QuantizedTensor.from_float(
-                weight.to(dtype),
-                "TensorWiseINT8Layout",
-                is_weight=True,
-                per_channel=True,
-                convrot=True,
-            )
-            quantized = quantized.to(device="cpu")
-            bias = None if bias is None else bias.to(device="cpu", dtype=dtype)
-        finally:
-            if offload_state is not None:
-                from comfy.ops import uncast_bias_weight
-
-                uncast_bias_weight(module, weight, bias, offload_state)
-    module.register_buffer("_mgpu_int8_weight", quantized, persistent=False)
-    module.register_buffer("_mgpu_int8_bias", bias, persistent=False)
-    module._mgpu_int8_lora = lora
-    module._mgpu_int8_key = key
-
-
 @_without_streaming
 def _prepare_linear_on_donor(module, dtype, donor_device):
     """Materialize a linear's weight on the donor; returns (weight, bias, offload_state, lora).
@@ -1141,7 +1078,7 @@ _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype
 def _staged_weight_bytes(module, dtype):
     if module._mgpu_quantized:
         return mm.module_size(module)
-    return module.out_features * module.in_features * (1 if module._mgpu_int8 else dtype.itemsize)
+    return module.out_features * module.in_features * dtype.itemsize
 
 
 def _copy_to_compute(weight, compute_device):
@@ -1170,12 +1107,11 @@ def _copy_to_compute(weight, compute_device):
 def _stage_linear(module, dtype, schedule=None):
     """Put a mixed linear's GEMM weight on the compute GPU, on the schedule's streams if given.
 
-    A quantized linear and mixed_int8 send their stored weight; mixed prepares the
-    weight on the donor. Returns None for a prepared weight larger than half
+    A quantized linear sends its stored weight; others are prepared on the donor. Returns None for a prepared weight larger than half
     the compute GPU's free memory, which streams in tiles instead.
     """
     compute_device = module._mgpu_compute_device
-    if not (module._mgpu_int8 or module._mgpu_quantized) and compute_device.type == "cuda" and (
+    if not module._mgpu_quantized and compute_device.type == "cuda" and (
         2 * _staged_weight_bytes(module, dtype)
         > mm.get_free_memory(compute_device) - _COMPUTE_GPU_RESERVE_BYTES
     ):
@@ -1187,9 +1123,6 @@ def _stage_linear(module, dtype, schedule=None):
     with streams:
         if module._mgpu_quantized:
             weight, bias, lora = module.weight, module.bias, ()
-            offload_state = None
-        elif module._mgpu_int8:
-            weight, bias, lora = module._mgpu_int8_weight, module._mgpu_int8_bias, module._mgpu_int8_lora
             offload_state = None
         else:
             weight, bias, offload_state, lora = _prepare_linear_on_donor(
@@ -1426,12 +1359,10 @@ def _configure_mixed_conv(module):
 _LINEAR_FUSION_KWARGS = frozenset(("input_act", "act_weight", "residual", "residual_scale"))
 
 
-def configure_mixed_gemm(module, compute_device, donor_device, int8=False, schedule=None):
+def configure_mixed_gemm(module, compute_device, donor_device, schedule=None):
     """Run an eligible linear's or conv's GEMM on the compute GPU; its activations stay on the donor.
 
-    With int8, the linear runs its load-time int8 weight (see
-    _prepare_mixed_int8_weight) as a Comfy Kitchen int8 GEMM. With a schedule,
-    each linear stages the next one's weight while it runs (see _run_mixed_linear).
+    With a schedule, each linear stages the next one's weight while it runs (see _run_mixed_linear).
     """
     if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
         tileable = _can_tile_conv_on_compute(module)
@@ -1455,7 +1386,6 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
         return True
 
     module._mgpu_donor_execution_device = torch.device(donor_device)
-    module._mgpu_int8 = int8
     # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
     module._mgpu_quantized = getattr(module, "layout_type", None) is not None
     module._mgpu_schedule = schedule
@@ -1490,11 +1420,10 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
             module._mgpu_donor_gemm_calls += 1
             if module._mgpu_donor_gemm_calls == 1:
                 logger.info(
-                    "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s%s)",
+                    "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s)",
                     module._mgpu_donor_execution_device,
                     module._mgpu_compute_device,
                     type(module).__name__,
-                    ", int8" if module._mgpu_int8 else "",
                 )
             return output
 
@@ -1566,7 +1495,7 @@ def _first_tensor(value):
 
 
 def _mixed_weight_device(module, donor_device):
-    """Where mixed mode stores a module's weights.
+    """Where a module's weights are stored while the donor holds activations.
 
     Castable weights stay where they were loaded (a memory-mapped GGUF stays
     on disk) and are prepared on the donor one layer at a time, so the donor's
@@ -1577,24 +1506,25 @@ def _mixed_weight_device(module, donor_device):
 
 
 def select_mixed_donor_device(model, block_assignments, compute_device):
-    """Pick the donor GPU that holds a mixed-mode model's activations, or None."""
+    """Pick the donor that holds a diffusion model's activations, or None.
+
+    A donor GPU is preferred over the CPU when the allocation uses both.
+    """
     compute_device = torch.device(compute_device)
     donors = sorted(
-        {str(device) for device in block_assignments.values()}
-        - {"cpu", str(compute_device)}
+        {str(device) for device in block_assignments.values()} - {str(compute_device)},
+        key=lambda device: device == "cpu",
     )
+    if not donors or not hasattr(model, "diffusion_model"):
+        return None
     reasons = []
-    if not hasattr(model, "diffusion_model"):
-        reasons.append("model has no diffusion model")
     if not _is_comfy_kitchen_attention_enabled():
         reasons.append("Comfy Kitchen attention is disabled")
-    if not donors:
-        reasons.append("allocation has no donor GPU")
-    else:
-        reasons.extend(_donor_gemm_skip_reasons(compute_device, torch.device(donors[0])))
+    if not _is_hip_software_gemm_device(compute_device):
+        reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
     if reasons:
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed mode disabled: %s", "; ".join(reasons)
+            "[MultiGPU DisTorch V2] Donor activations disabled: %s", "; ".join(reasons)
         )
         return None
     return torch.device(donors[0])
@@ -1661,84 +1591,6 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
             len(schedule.mlp_linears),
             compute_device,
         )
-
-
-def configure_hip_donor_gemm_offload(
-    module, compute_device, donor_device, execution_mode="disabled"
-):
-    """Run an eligible donor-assigned software-GEMM module on its donor GPU."""
-    original_forward = getattr(module, "_mgpu_original_forward", None)
-    compute_device = torch.device(compute_device)
-    donor_device = torch.device(donor_device)
-    enabled = (
-        execution_mode == "all"
-        and _is_eligible_donor_gemm(module)
-        and _is_comfy_kitchen_attention_enabled()
-        and not _donor_gemm_skip_reasons(compute_device, donor_device)
-    )
-
-    if not enabled:
-        if original_forward is not None:
-            module.forward = original_forward
-            del module._mgpu_original_forward
-            del module._mgpu_donor_execution_device
-            if hasattr(module, "_mgpu_donor_preparation_logged"):
-                del module._mgpu_donor_preparation_logged
-        return False
-
-    if original_forward is None:
-        original_forward = module.forward
-        module._mgpu_original_forward = original_forward
-        module._mgpu_donor_gemm_calls = 0
-
-        def donor_forward(*args, **kwargs):
-            target_device = module._mgpu_donor_execution_device
-            donor_args = _move_tensors(args, target_device)
-            donor_kwargs = _move_tensors(kwargs, target_device)
-            with _current_device(target_device):
-                output = module._mgpu_original_forward(*donor_args, **donor_kwargs)
-            output = _move_tensors(output, module._mgpu_compute_device)
-            module._mgpu_donor_gemm_calls += 1
-            if module._mgpu_donor_gemm_calls == 1:
-                logger.info(
-                    "[MultiGPU DisTorch V2] Donor GEMM active: %s -> %s (%s)",
-                    module._mgpu_compute_device,
-                    target_device,
-                    type(module).__name__,
-                )
-            return output
-
-        module.forward = donor_forward
-
-    module._mgpu_compute_device = compute_device
-    module._mgpu_donor_execution_device = donor_device
-    return True
-
-
-def pin_hip_offloaded_weight(module):
-    """Convert a CPU module weight into the HIP backend's mapped-host format."""
-    if not getattr(torch.version, "hip", None):
-        return False
-
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.device.type != "cpu":
-        return False
-    if weight.is_pinned():
-        return True
-
-    try:
-        from comfy_kitchen.backends import hip
-    except ImportError:
-        return False
-
-    offload_weight = getattr(hip, "offload_weight", None)
-    if not callable(offload_weight):
-        return False
-
-    # Swap only the storage: replacing the weight drops tensor-subclass metadata
-    # such as a GGUF weight's quant type and logical shape.
-    weight.data = offload_weight(weight.data)
-    return True
 
 
 def register_patched_safetensor_modelpatcher():
@@ -2013,9 +1865,6 @@ def register_patched_safetensor_modelpatcher():
                 return result
 
             allocations = inner_model._distorch_v2_meta["full_allocation"]
-            donor_gemm_execution_mode = inner_model._distorch_v2_meta.get(
-                "donor_gemm_execution_mode", "disabled"
-            )
 
             if not hasattr(self.model, "_distorch_high_precision_loras"):
                 self.model._distorch_high_precision_loras = True
@@ -2078,52 +1927,30 @@ def register_patched_safetensor_modelpatcher():
             )
             # DisTorch2 VAE loaders patch the VAE's first_stage_model directly. A VAE's
             # decode tiles already bound its activations, so it runs on the compute GPU
-            # with its weights where the allocation put them instead of in mixed mode.
+            # with its weights where the allocation put them instead of on the donor.
             is_vae = (
                 not is_clip_model
                 and not hasattr(self.model, "diffusion_model")
                 and hasattr(self.model, "decode")
             )
             mixed_donor_device = None
-            mixed_int8 = donor_gemm_execution_mode == "mixed_int8"
-            int8_layers = 0
             schedule = None
-            if donor_gemm_execution_mode in ("mixed", "mixed_int8") and not is_vae:
+            if not is_vae:
                 mixed_donor_device = select_mixed_donor_device(
                     self.model,
                     device_assignments["block_assignments"],
                     device_to,
                 )
-            # Mixed mode keeps activations on the donor, so weights stored anywhere
-            # else are cast to it at runtime.
-            activation_device = mixed_donor_device or device_to
             if mixed_donor_device is not None:
                 logger.info(
-                    "[MultiGPU DisTorch V2] Mixed mode: %s holds activations; weights stay in system RAM or memory-mapped on disk",
+                    "[MultiGPU DisTorch V2] %s holds activations; weights stay in system RAM or memory-mapped on disk",
                     mixed_donor_device,
                 )
-                schedule = _MixedSchedule(device_to, mixed_donor_device)
-                if mixed_int8:
-                    int8_dtype = self.model.get_dtype_inference()
-
-            def prepare_int8(module_object, module_name):
-                keys = [f"{module_name}._mgpu_int8_weight", f"{module_name}._mgpu_int8_bias"]
-                if getattr(module_object, "_mgpu_int8_key", None) != self.patches_uuid:
-                    # New patches replace the int8 weights; release the old pins first.
-                    for key in keys:
-                        self.unpin_weight(key)
-                _prepare_mixed_int8_weight(
-                    module_object,
-                    module_name,
-                    self.patches,
-                    int8_dtype,
-                    mixed_donor_device,
-                    self.patches_uuid,
+                # A CPU donor would dequantize and patch weights far slower than the compute GPU.
+                prepare_device = (
+                    mixed_donor_device if mixed_donor_device.type == "cuda" else torch.device(device_to)
                 )
-                # Pinned, the weight copies to the compute GPU while the previous unit runs.
-                # Also re-pins weights reused after unpatch_model unpinned them.
-                for key in keys:
-                    self.pin_weight_to_device(key)
+                schedule = _MixedSchedule(device_to, prepare_device)
 
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
@@ -2138,14 +1965,7 @@ def register_patched_safetensor_modelpatcher():
                     block_target_device = device_assignments["block_assignments"].get(
                         module_name, device_to
                     )
-                    int8_layer = (
-                        mixed_donor_device is not None
-                        and mixed_int8
-                        and _is_mixed_int8_linear(module_object)
-                    )
-                    if int8_layer:
-                        block_target_device = "cpu"
-                    elif mixed_donor_device is not None:
+                    if mixed_donor_device is not None:
                         block_target_device = _mixed_weight_device(
                             module_object, mixed_donor_device
                         )
@@ -2171,17 +1991,7 @@ def register_patched_safetensor_modelpatcher():
 
                     if mixed_donor_device is not None:
                         configure_mixed_gemm(
-                            module_object, device_to, mixed_donor_device, int8_layer, schedule
-                        )
-                        if int8_layer:
-                            prepare_int8(module_object, module_name)
-                            int8_layers += 1
-                    else:
-                        configure_hip_donor_gemm_offload(
-                            module_object,
-                            device_to,
-                            block_target_device,
-                            donor_gemm_execution_mode,
+                            module_object, device_to, prepare_device, schedule
                         )
 
                     mem_counter += module_size
@@ -2190,16 +2000,7 @@ def register_patched_safetensor_modelpatcher():
                 block_target_device = device_assignments["block_assignments"].get(
                     module_name, device_to
                 )
-                int8_layer = (
-                    mixed_donor_device is not None
-                    and mixed_int8
-                    and _is_mixed_int8_linear(module_object)
-                )
-                if int8_layer:
-                    # The original stays where it was loaded (a memory-mapped GGUF
-                    # stays on disk); the load-time int8 weight is kept in RAM.
-                    block_target_device = "cpu"
-                elif mixed_donor_device is not None:
+                if mixed_donor_device is not None:
                     block_target_device = _mixed_weight_device(
                         module_object, mixed_donor_device
                     )
@@ -2211,13 +2012,12 @@ def register_patched_safetensor_modelpatcher():
                 # Step 2: Apply LoRa patches on the assigned device.
                 weight_key = f"{module_name}.weight"
                 bias_key = f"{module_name}.bias"
-                # int8 layers merge their patches into the int8 weight instead.
                 with _current_device(block_target_device):
-                    if weight_key in self.patches and not int8_layer:
+                    if weight_key in self.patches:
                         self.patch_weight_to_device(
                             weight_key, device_to=block_target_device
                         )
-                    if bias_key in self.patches and not int8_layer:
+                    if bias_key in self.patches:
                         self.patch_weight_to_device(
                             bias_key, device_to=block_target_device
                         )
@@ -2236,7 +2036,6 @@ def register_patched_safetensor_modelpatcher():
 
                 if (
                     not high_precision_loras
-                    and not int8_layer
                     and block_target_device == "cpu"
                     and has_patches
                     and model_original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -2255,47 +2054,24 @@ def register_patched_safetensor_modelpatcher():
                                 f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage"
                             )
 
-                # Step 4: Enable runtime weight casting for offloaded modules.
-                if str(block_target_device) != str(activation_device):
-                    # Only donor GEMMs (all) read host weights directly; everywhere
-                    # else pinning would just copy a memory-mapped GGUF into RAM.
-                    if (
-                        block_target_device == "cpu"
-                        and donor_gemm_execution_mode == "all"
-                        and pin_hip_offloaded_weight(module_object)
-                    ):
-                        logger.debug(
-                            f"[MultiGPU DisTorch V2] Pinned {module_name} weight for direct HIP host access"
-                        )
+                # Step 4: Enable runtime weight casting for offloaded modules. With a
+                # donor, every castable weight is prepared away from where it is stored.
+                if mixed_donor_device is not None:
+                    cast_weights = hasattr(module_object, "comfy_cast_weights")
+                else:
+                    cast_weights = str(block_target_device) != str(device_to)
+                if cast_weights:
                     module_object.comfy_cast_weights = True
 
                 if mixed_donor_device is not None:
                     configure_mixed_gemm(
-                        module_object, device_to, mixed_donor_device, int8_layer, schedule
-                    )
-                    if int8_layer:
-                        prepare_int8(module_object, module_name)
-                        int8_layers += 1
-                elif configure_hip_donor_gemm_offload(
-                    module_object,
-                    device_to,
-                    block_target_device,
-                    donor_gemm_execution_mode,
-                ):
-                    logger.debug(
-                        f"[MultiGPU DisTorch V2] Running {module_name} GEMM on donor {block_target_device}"
+                        module_object, device_to, prepare_device, schedule
                     )
 
                 # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
                 mem_counter += module_size
 
-            if int8_layers:
-                logger.info(
-                    "[MultiGPU DisTorch V2] mixed_int8: %d linears stored as int8 in system RAM; %s holds activations",
-                    int8_layers,
-                    mixed_donor_device,
-                )
             if mixed_donor_device is not None:
                 configure_mixed_execution(
                     self.model.diffusion_model, mixed_donor_device, device_to, schedule

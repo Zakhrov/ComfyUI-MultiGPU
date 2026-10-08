@@ -43,13 +43,6 @@ def _create_distorch_safetensor_v2_override(
                 {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
             )
             inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
-            inputs["optional"]["donor_gemm_execution_mode"] = (
-                ["disabled", "mixed", "mixed_int8", "all"],
-                {
-                    "default": "disabled",
-                    "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; mixed_int8 also requantizes prepared weights to int8 for Comfy Kitchen int8 GEMMs; all runs every eligible GEMM on the donor.",
-                },
-            )
             inputs["optional"]["expert_mode_allocations"] = (
                 "STRING",
                 {"multiline": False, "default": ""},
@@ -70,13 +63,12 @@ def _create_distorch_safetensor_v2_override(
             *args,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
         ):
             device_value = kwargs.get(device_param_name)
-            settings_str = f"{device_value}{virtual_vram_gb}{donor_device}{donor_gemm_execution_mode}{expert_mode_allocations}{eject_models}"
+            settings_str = f"{device_value}{virtual_vram_gb}{donor_device}{expert_mode_allocations}{eject_models}"
             current_hash = hashlib.sha256(settings_str.encode()).hexdigest()
 
             if not hasattr(cls, "_last_hash"):
@@ -94,7 +86,6 @@ def _create_distorch_safetensor_v2_override(
             *args,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
@@ -159,7 +150,6 @@ def _create_distorch_safetensor_v2_override(
                     device_param_name,
                     "virtual_vram_gb",
                     "donor_device",
-                    "donor_gemm_execution_mode",
                     "expert_mode_allocations",
                     "eject_models",
                 ]
@@ -193,10 +183,7 @@ def _create_distorch_safetensor_v2_override(
 
             if model_to_check and full_allocation:
                 inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {
-                    "full_allocation": full_allocation,
-                    "donor_gemm_execution_mode": donor_gemm_execution_mode,
-                }
+                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
 
             logger.info(
                 f"[MultiGPU DisTorch V2] Full allocation string: {full_allocation}"
@@ -373,13 +360,6 @@ def override_class_with_distorch_gguf_v2(cls):
                 {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
             )
             inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
-            inputs["optional"]["donor_gemm_execution_mode"] = (
-                ["disabled", "mixed", "mixed_int8", "all"],
-                {
-                    "default": "disabled",
-                    "tooltip": "disabled uses standard ComfyUI execution. mixed requires a software-GEMM HIP GPU and Comfy Kitchen attention; mixed_int8 also requantizes prepared weights to int8 for Comfy Kitchen int8 GEMMs; all runs every eligible GEMM on the donor.",
-                },
-            )
             inputs["optional"]["expert_mode_allocations"] = (
                 "STRING",
                 {"multiline": False, "default": ""},
@@ -396,7 +376,6 @@ def override_class_with_distorch_gguf_v2(cls):
             compute_device=None,
             virtual_vram_gb=4.0,
             donor_device="cpu",
-            donor_gemm_execution_mode="disabled",
             expert_mode_allocations="",
             **kwargs,
         ):
@@ -413,7 +392,6 @@ def override_class_with_distorch_gguf_v2(cls):
                     "compute_device",
                     "virtual_vram_gb",
                     "donor_device",
-                    "donor_gemm_execution_mode",
                     "expert_mode_allocations",
                 ]
             }
@@ -447,10 +425,7 @@ def override_class_with_distorch_gguf_v2(cls):
 
             if model_to_check and full_allocation:
                 inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {
-                    "full_allocation": full_allocation,
-                    "donor_gemm_execution_mode": donor_gemm_execution_mode,
-                }
+                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
             try:
                 return out
             finally:

@@ -65,16 +65,6 @@ class DonorModule:
         return value * scale
 
 
-class DonorLinearModule:
-    def __init__(self, device):
-        self.weight = torch.eye(2, device=device)
-        self.input_device = None
-
-    def forward(self, value):
-        self.input_device = value.device
-        return functional.linear(value, self.weight)
-
-
 class AllocationModule:
     def __init__(self):
         self.weight = torch.empty(2, 2)
@@ -103,101 +93,13 @@ class TestHipDonorGemmOffload(unittest.TestCase):
     def setUp(self):
         self.distorch = load_distorch_module()
 
-    def test_executes_and_returns_through_donor_wrapper(self):
-        module = DonorModule()
-        moved_devices = []
-
-        def record_move(value, device):
-            moved_devices.append(torch.device(device))
-            return value
-
-        with (
-            mock.patch.object(
-                self.distorch, "_is_hip_software_gemm_device", return_value=True
-            ),
-            mock.patch.object(
-                self.distorch.mm,
-                "comfy_kitchen_attention_enabled",
-                return_value=True,
-                create=True,
-            ),
-            mock.patch.object(self.distorch, "_move_tensors", side_effect=record_move),
-        ):
-            self.assertTrue(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1", execution_mode="all"
-                )
-            )
-            result = module.forward(torch.tensor(3), scale=2)
-
-        self.assertEqual(result.item(), 6)
-        self.assertEqual(module.calls, [(torch.tensor(3), 2)])
-        self.assertEqual(module._mgpu_donor_gemm_calls, 1)
-        self.assertEqual(
-            moved_devices, [torch.device("cuda:1")] * 2 + [torch.device("cuda:0")]
-        )
-
-    def test_restores_original_forward_when_not_eligible(self):
-        module = DonorModule()
-        original_forward = module.forward
-
-        with mock.patch.object(
-            self.distorch, "_is_hip_software_gemm_device", return_value=True
-        ), mock.patch.object(
-            self.distorch.mm,
-            "comfy_kitchen_attention_enabled",
-            return_value=True,
-            create=True,
-        ):
-            self.distorch.configure_hip_donor_gemm_offload(
-                module, "cuda:0", "cuda:1", execution_mode="all"
-            )
-            self.assertFalse(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:0"
-                )
-            )
-
-        self.assertNotIn("_mgpu_original_forward", module.__dict__)
-        self.assertEqual(module.forward.__func__, original_forward.__func__)
-
-    def test_requires_two_dimensional_weight(self):
-        module = DonorModule()
-        module.weight = torch.empty(2)
-
-        with mock.patch.object(
-            self.distorch, "_is_hip_software_gemm_device", return_value=True
-        ), mock.patch.object(
-            self.distorch.mm,
-            "comfy_kitchen_attention_enabled",
-            return_value=True,
-            create=True,
-        ):
-            self.assertFalse(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1", execution_mode="all"
-                )
-            )
-
     def test_mixed_linear_wraps_large_linears(self):
         module = torch.nn.Linear(1, 16 * 1024 * 1024 // 4 + 1, bias=False)
 
         self.assertTrue(self.distorch.configure_mixed_gemm(module, "cuda:0", "cuda:1"))
         self.assertEqual(module._mgpu_compute_device, torch.device("cuda:0"))
 
-    def test_disabled_mode_does_not_enable_donor_gemm(self):
-        module = DonorModule()
-
-        with mock.patch.object(
-            self.distorch, "_is_hip_software_gemm_device", return_value=True
-        ):
-            self.assertFalse(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1"
-                )
-            )
-
-    def test_mixed_mode_requires_comfy_kitchen_attention(self):
+    def test_donor_activations_require_comfy_kitchen_attention(self):
         model = types.SimpleNamespace(diffusion_model=object())
 
         with mock.patch.object(
@@ -227,6 +129,31 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             )
 
         self.assertEqual(donor, torch.device("cuda:1"))
+
+    def test_selects_cpu_donor_and_skips_models_without_a_donor(self):
+        model = types.SimpleNamespace(diffusion_model=object())
+
+        with mock.patch.object(
+            self.distorch, "_is_hip_software_gemm_device", return_value=True
+        ), mock.patch.object(
+            self.distorch.mm,
+            "comfy_kitchen_attention_enabled",
+            return_value=True,
+            create=True,
+        ):
+            donor = self.distorch.select_mixed_donor_device(
+                model, {"a": "cuda:0", "c": "cpu"}, "cuda:0"
+            )
+            self.assertIsNone(
+                self.distorch.select_mixed_donor_device(model, {"a": "cuda:0"}, "cuda:0")
+            )
+            self.assertIsNone(
+                self.distorch.select_mixed_donor_device(
+                    types.SimpleNamespace(), {"a": "cuda:0", "c": "cpu"}, "cuda:0"
+                )
+            )
+
+        self.assertEqual(donor, torch.device("cpu"))
 
     def test_tiled_linear_streams_weight_tiles_when_budget_is_small(self):
         module = torch.nn.Linear(3, 5, bias=True).requires_grad_(False)
@@ -560,6 +487,37 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertIn("optimized_attention_override", calls[1])
         self.assertNotIn("optimized_attention_override", transformer_options)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a compute GPU")
+    def test_cpu_donor_keeps_activations_in_ram_and_matches_cpu(self):
+        class DiffusionModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(64, 128)
+                self.norm = torch.nn.LayerNorm(128)
+                self.out = torch.nn.Linear(128, 64)
+                self.devices = []
+
+            def forward(self, x, timestep, transformer_options={}):
+                h = self.norm(self.proj(x)) * (1 + timestep)
+                self.devices.append(h.device)
+                return self.out(functional.gelu(h)) + x
+
+        model = DiffusionModel().requires_grad_(False)
+        x, timestep = torch.randn(2, 32, 64), torch.full((1,), 0.5)
+        expected = model(x, timestep)
+        compute = torch.device("cuda:0")
+        schedule = self.distorch._MixedSchedule(compute, compute)
+        for module in (model.proj, model.out):
+            self.assertTrue(self.distorch.configure_mixed_gemm(module, compute, compute, schedule=schedule))
+        self.distorch.configure_mixed_execution(model, "cpu", compute, schedule)
+
+        with mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30, create=True):
+            output = model(x.to(compute), timestep.to(compute))
+
+        self.assertEqual(model.devices[-1], torch.device("cpu"))
+        self.assertEqual(output.device, compute)
+        self.assertTrue(torch.allclose(output.cpu(), expected, atol=1e-4))
+
     def test_donor_prepared_linear_matches_full_linear(self):
         module = torch.nn.Linear(3, 5, bias=True).requires_grad_(False)
         input_tensor = torch.randn(2, 3)
@@ -672,32 +630,6 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertEqual(self.distorch._mixed_weight_device(AllocationModule(), donor), "cpu")
         self.assertEqual(self.distorch._mixed_weight_device(torch.nn.LayerNorm(2), donor), donor)
 
-    def test_pinning_keeps_quantized_weight_metadata(self):
-        class PackedTensor(torch.Tensor):
-            pass
-
-        module = torch.nn.Linear(1, 1, bias=False)
-        weight = torch.randint(0, 255, (4, 144), dtype=torch.uint8).as_subclass(PackedTensor)
-        module.weight = torch.nn.Parameter(weight, requires_grad=False)
-        module.weight.tensor_type = "Q4_K"
-        hip = types.ModuleType("comfy_kitchen.backends.hip")
-        hip.offload_weight = lambda value: value.clone()
-        backends = types.ModuleType("comfy_kitchen.backends")
-        backends.hip = hip
-
-        with (
-            mock.patch.object(torch.version, "hip", "6.4"),
-            mock.patch.dict(
-                sys.modules,
-                {"comfy_kitchen.backends": backends, "comfy_kitchen.backends.hip": hip},
-            ),
-        ):
-            self.assertTrue(self.distorch.pin_hip_offloaded_weight(module))
-
-        self.assertIsInstance(module.weight, PackedTensor)
-        self.assertEqual(module.weight.tensor_type, "Q4_K")
-        self.assertTrue(torch.equal(module.weight, weight))
-
     def test_mixed_mode_requires_standard_linear_tiling(self):
         self.assertFalse(self.distorch.configure_mixed_gemm(DonorModule(), "cuda:0", "cuda:1"))
 
@@ -738,26 +670,6 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         # already make _PIPELINE_CHUNKS chunks at that size.
         self.assertEqual(chunks, [2, 2, 2, 2])
         self.assertTrue(torch.allclose(output, expected))
-
-    def test_mixed_int8_linear_runs_stored_weight_and_keeps_lora_low_rank(self):
-        module = torch.nn.Linear(3, 5).requires_grad_(False)
-        up, down = torch.randn(5, 2), torch.randn(2, 3)
-        self.assertTrue(self.distorch.configure_mixed_gemm(module, "cpu", "cpu", int8=True))
-        module._mgpu_int8_weight = module.weight + 1
-        module._mgpu_int8_bias = module.bias
-        module._mgpu_int8_lora = [(down, up, 0.5)]
-        input_tensor = torch.randn(2, 3, 3)
-        free_bytes = self.distorch._COMPUTE_GPU_RESERVE_BYTES + 2 * (3 + 5 + 2) * 4 * 2
-
-        with mock.patch.object(
-            self.distorch.mm, "get_free_memory", lambda *_: free_bytes, create=True
-        ):
-            output = module(input_tensor)
-
-        expected = functional.linear(
-            input_tensor, module.weight + 1 + 0.5 * (up @ down), module.bias
-        )
-        self.assertTrue(torch.allclose(output, expected, atol=1e-5))
 
     def test_mixed_linear_unfolds_fused_prologue_and_residual(self):
         """Linear(x, input_act=..., residual=...) keeps its GEMM on the compute path."""
@@ -951,83 +863,6 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         for module in (normed, single, unstaged):
             self.assertIsNone(self.distorch._fused_mlp_linears(module, schedule))
 
-    def test_mixed_int8_needs_convrot_group_aligned_features(self):
-        self.assertTrue(self.distorch._is_mixed_int8_linear(torch.nn.Linear(512, 4)))
-        self.assertFalse(self.distorch._is_mixed_int8_linear(torch.nn.Linear(96, 4)))
-        quantized = torch.nn.Linear(512, 4)
-        quantized.layout_type = "TensorWiseINT8Layout"
-        self.assertFalse(self.distorch._is_mixed_int8_linear(quantized))
-
-    def int8_modules(self, merged):
-        quant_ops = types.ModuleType("comfy.quant_ops")
-        lora = types.ModuleType("comfy.lora")
-        quantized = []
-
-        class QuantizedTensor:
-            @staticmethod
-            def from_float(tensor, layout, **kwargs):
-                quantized.append((layout, kwargs))
-                return tensor.clone()
-
-        def calculate_weight(patches, weight, key):
-            merged.append(key)
-            return weight + 1
-
-        quant_ops.QuantizedTensor = QuantizedTensor
-        lora.calculate_weight = calculate_weight
-        return {
-            "comfy.quant_ops": quant_ops,
-            "comfy.lora": lora,
-            "comfy.weight_adapter.lora": self.lora_adapter_module(),
-        }, quantized
-
-    def test_prepares_int8_weight_once_per_patch_set(self):
-        merged = []
-        modules, quantized = self.int8_modules(merged)
-        module = torch.nn.Linear(3, 5).requires_grad_(False)
-        up, down = torch.randn(5, 2), torch.randn(2, 3)
-        adapter = modules["comfy.weight_adapter.lora"].LoRAAdapter((up, down, None, None, None, None))
-        patches = {"linear.weight": [(0.5, adapter, 1.0, None, None)]}
-
-        with mock.patch.dict(sys.modules, modules):
-            prepare = self.distorch._prepare_mixed_int8_weight
-            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-1")
-            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-1")
-            self.assertEqual(len(quantized), 1)
-            prepare(module, "linear", patches, torch.float32, "cpu", "uuid-2")
-
-        self.assertEqual(
-            quantized,
-            2 * [("TensorWiseINT8Layout", {"is_weight": True, "per_channel": True, "convrot": True})],
-        )
-        # The plain LoRA stays low rank; the stored weight is the unpatched original.
-        self.assertEqual(merged, [])
-        self.assertTrue(torch.equal(module._mgpu_int8_weight, module.weight))
-        self.assertTrue(torch.equal(module._mgpu_int8_bias, module.bias))
-        (lora_down, lora_up, scale), = module._mgpu_int8_lora
-        self.assertIs(lora_down, down)
-        self.assertEqual(scale, 0.5)
-        self.assertNotIn("_mgpu_int8_weight", module.state_dict())
-
-    def test_merges_non_plain_patches_into_int8_weight(self):
-        merged = []
-        modules, _ = self.int8_modules(merged)
-        module = torch.nn.Linear(3, 5).requires_grad_(False)
-        patches = {
-            "linear.weight": [(1.0, object(), 1.0, None, None)],
-            "linear.bias": [(1.0, object(), 1.0, None, None)],
-        }
-
-        with mock.patch.dict(sys.modules, modules):
-            self.distorch._prepare_mixed_int8_weight(
-                module, "linear", patches, torch.float32, "cpu", "uuid"
-            )
-
-        self.assertEqual(merged, ["linear.weight", "linear.bias"])
-        self.assertTrue(torch.equal(module._mgpu_int8_weight, module.weight + 1))
-        self.assertTrue(torch.equal(module._mgpu_int8_bias, module.bias + 1))
-        self.assertEqual(module._mgpu_int8_lora, ())
-
     def test_accepts_comfy_mixed_precision_linear_for_compute_tiling(self):
         class MixedPrecisionLinear(torch.nn.Module):
             quant_format = "int8_tensorwise"
@@ -1137,42 +972,6 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertEqual(assignments["block_assignments"]["linear"], "cuda:1")
 
-    def test_all_mode_executes_large_gemms_on_donor(self):
-        module = DonorModule()
-        module.weight = torch.empty(
-            16 * 1024 * 1024 // 4 + 1,
-            dtype=torch.float32,
-        ).reshape(-1, 1)
-
-        with (
-            mock.patch.object(
-                self.distorch, "_is_hip_software_gemm_device", return_value=True
-            ),
-            mock.patch.object(
-                self.distorch.mm,
-                "comfy_kitchen_attention_enabled",
-                return_value=True,
-                create=True,
-            ),
-        ):
-            self.assertTrue(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1", execution_mode="all"
-                )
-            )
-
-    def test_all_mode_requires_comfy_kitchen_attention(self):
-        module = DonorModule()
-
-        with mock.patch.object(
-            self.distorch, "_is_hip_software_gemm_device", return_value=True
-        ):
-            self.assertFalse(
-                self.distorch.configure_hip_donor_gemm_offload(
-                    module, "cuda:0", "cuda:1", execution_mode="all"
-                )
-            )
-
     def test_recognizes_only_supported_software_gemm_architectures(self):
         properties = types.SimpleNamespace(gcnArchName="gfx1030:sramecc+:xnack-")
         with (
@@ -1184,33 +983,3 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             self.assertTrue(self.distorch._is_hip_software_gemm_device("cuda:0"))
             properties.gcnArchName = "gfx1100"
             self.assertFalse(self.distorch._is_hip_software_gemm_device("cuda:0"))
-
-    def test_rocm_donor_linear_execution(self):
-        if not getattr(torch.version, "hip", None) or torch.cuda.device_count() < 2:
-            self.skipTest("requires two ROCm GPUs")
-        if not (
-            self.distorch._is_hip_software_gemm_device("cuda:0")
-            and self.distorch._is_hip_software_gemm_device("cuda:1")
-        ):
-            self.skipTest("requires two HIP software-GEMM GPUs")
-        if not self.distorch._is_comfy_kitchen_attention_enabled():
-            self.skipTest("requires Comfy Kitchen attention")
-
-        compute_device = torch.device("cuda:0")
-        donor_device = torch.device("cuda:1")
-        module = DonorLinearModule(donor_device)
-        input_tensor = torch.tensor([[2.0, 3.0]], device=compute_device)
-
-        self.assertTrue(
-            self.distorch.configure_hip_donor_gemm_offload(
-                module, compute_device, donor_device, execution_mode="all"
-            )
-        )
-        result = module.forward(input_tensor)
-        torch.cuda.synchronize(compute_device)
-        torch.cuda.synchronize(donor_device)
-
-        self.assertEqual(module.input_device, donor_device)
-        self.assertEqual(result.device, compute_device)
-        self.assertTrue(torch.equal(result.cpu(), input_tensor.cpu()))
-        self.assertEqual(module._mgpu_donor_gemm_calls, 1)

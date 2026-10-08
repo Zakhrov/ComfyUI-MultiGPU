@@ -1,9 +1,9 @@
 """Profile one steady-state sampling step of a DisTorch2 model on both GPUs.
 
 Run from anywhere with ComfyUI's venv:
-    .venv/bin/python custom_nodes/ComfyUI-MultiGPU/tests/profile_mixed_forward.py --mode mixed_int8
+    .venv/bin/python custom_nodes/ComfyUI-MultiGPU/tests/profile_mixed_forward.py --donor cuda:1
 Re-analyze a saved trace without a GPU:
-    ... --analyze /tmp/mixed_int8.trace.json
+    ... --analyze /tmp/mixed_forward.trace.json
 
 The step after the first is profiled (the first loads and converts weights), and
 the step after that is timed without the profiler.
@@ -254,14 +254,13 @@ def run(args):
         loader = nodes.NODE_CLASS_MAPPINGS["UnetLoaderGGUFDisTorch2MultiGPU"]()
         (model,) = loader.override(
             unet_name=args.gguf, compute_device="cuda:0", virtual_vram_gb=args.virtual_vram,
-            donor_device="cuda:1", donor_gemm_execution_mode=args.mode, expert_mode_allocations="", eject_models=True,
+            donor_device=args.donor, expert_mode_allocations="", eject_models=True,
         )
     else:
         loader = nodes.NODE_CLASS_MAPPINGS["UNETLoaderDisTorch2MultiGPU"]()
         (model,) = loader.override(
             unet_name=args.unet, weight_dtype="default", compute_device="cuda:0",
-            virtual_vram_gb=args.virtual_vram, donor_device="cuda:1" if args.mode != "disabled" else "cpu",
-            donor_gemm_execution_mode=args.mode, expert_mode_allocations="", eject_models=True,
+            virtual_vram_gb=args.virtual_vram, donor_device=args.donor, expert_mode_allocations="", eject_models=True,
         )
 
     latent = torch.zeros(1, 16, args.size // 8, args.size // 8)
@@ -300,14 +299,14 @@ def run(args):
         callback=callback, disable_pbar=True, seed=0,
     )
     print(f"result mean {result.float().mean():.6f} std {result.float().std():.6f}", flush=True)
-    print(f"\nunprofiled step 2 wall: see the 'step 2 finished' line above (mode={args.mode})")
+    print(f"\nunprofiled step 2 wall: see the 'step 2 finished' line above (donor={args.donor})")
     if not args.no_profile:
         analyze(args.trace)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="mixed_int8", choices=("disabled", "mixed", "mixed_int8"))
+    parser.add_argument("--donor", default="cuda:1", help="device that holds activations, e.g. cuda:1 or cpu")
     parser.add_argument("--unet", default="z_image_turbo_int8_convrot.safetensors")
     parser.add_argument("--gguf", default=None, help="GGUF unet name, e.g. unsloth/z-image-turbo-Q8_0.gguf")
     parser.add_argument("--size", type=int, default=1024)
