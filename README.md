@@ -13,7 +13,7 @@ A fork of [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-Mult
 | Area | Change |
 | --- | --- |
 | Donor GEMM execution | New `donor_gemm_execution_mode` input (`disabled`, `mixed`, `mixed_int8`, `all`) on DisTorch2 loaders and the DisTorch2 checkpoint loader. Runs linear, conv and attention work split across a compute GPU and a donor GPU instead of copying donor weights back for every op. See [ROCm donor GEMM execution](#rocm-donor-gemm-execution). |
-| VAE | `VAELoaderDisTorch2MultiGPU` supports `mixed` mode for image and video VAE encode/decode, including temporal caches such as Wan's. |
+| VAE | With `mixed` or `mixed_int8`, `VAELoaderDisTorch2MultiGPU` keeps the VAE's weights on the donor and runs encode/decode on the compute GPU. |
 | GGUF text encoder | New `CCTechClipProjLoaderDisTorch2MultiGPU` for [ComfyUI-GGUF-Loader](https://github.com/ChrisColeTech/ComfyUI-GGUF-Loader)'s Text Encoder + ClipProj Loader. Layers the allocation leaves on `cpu` stay memory-mapped on disk and are streamed one layer at a time. |
 | WanVideoWrapper | The WanVideo model loader falls back to the offload-aware default RMSNorm when PyTorch RMSNorm is selected, since the native one is incompatible with WanVideo VRAM management. |
 | Tests | `tests/test_distorch_hip_donor.py` covers the donor GEMM paths. |
@@ -53,7 +53,7 @@ Both the compute and the donor GPU must use the HIP software-GEMM path:
 
 RDNA3 and later, and CDNA (native WMMA) GPUs keep normal DisTorch2 placement. To confirm the donor path is in use, check the ComfyUI log:
 
-- `mixed` / `mixed_int8`: `[MultiGPU DisTorch V2] Mixed execution: activations on cuda:1, GEMMs and attention on cuda:0`. If a requirement isn't met, `Mixed mode disabled: <reasons>` is logged and the model loads normally.
+- `mixed` / `mixed_int8`: `[MultiGPU DisTorch V2] Mixed execution: activations on cuda:1, all compute on cuda:0`. If a requirement isn't met, `Mixed mode disabled: <reasons>` is logged and the model loads normally.
 - `all`: `[MultiGPU DisTorch V2] Donor GEMM active: cuda:0 -> cuda:1`.
 
 Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM on the compute GPU. Use Expert mode to put a meaningful group of layers on the donor, for example `cuda:0,2gb;cuda:1,4gb;cpu,*`.
@@ -64,15 +64,15 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
 
 - **`mixed`**: the donor GPU stores activations and prepares weights; the compute GPU runs every other operation. Built for AMD+AMD laptops and systems; tested on a Dell G5 15 SE (RX 5600M 6 GB + Ryzen Vega APU).
   - Activations stay on the donor, and each operation on them (norms, modulation, RoPE, residuals, ...) copies its inputs to the compute GPU, runs there and copies the result back, so the donor runs no activation math. A few copy kernels still launch on the donor for strided tensors. An op whose tensors don't fit the compute GPU's free VRAM runs in slices instead (elementwise ops, softmax, layer norm, reductions, `cat`/`stack`, matmuls, padding and upsampling), with copies overlapping compute, so activation size is limited by donor memory. Any other op that doesn't fit fails with an out-of-memory error naming the op. The donor's memory holds activations, so high-resolution images and long videos are limited by donor memory (for example an APU using shared system RAM), not compute-GPU VRAM.
-  - Linear GEMMs are sent to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied back to the donor. Work is split into at least 8 chunks, and the copies run on a side stream overlapping neighbouring chunks' compute. At most two chunks are in flight.
+  - Linear GEMMs are sent to the compute GPU in token and weight tiles sized to its free VRAM, and each result tile is copied back to the donor. Float GEMMs use ComfyUI's `dense_linear`, which runs Comfy Kitchen's packed-fp16 GEMM where it is faster (`gfx1010`, `gfx90c`: about 2.5× rocBLAS). Work is split into at least 8 chunks, and the copies run on a side stream overlapping neighbouring chunks' compute. At most two chunks are in flight.
   - Each linear prepares the next linear's weight (cast, dequantize, patch) on a separate donor stream while the current GEMM runs. This is the only math the donor runs. Nothing is staged across forwards.
   - Token-wise MLPs (SwiGLU `w1`/`w2`/`w3` feed-forwards and `Sequential` linear/activation MLPs) run whole on the compute GPU, one token chunk at a time, so their wide hidden activation never returns to the donor. The compute GPU holds the MLP's weights together for that layer.
   - Attention runs on the compute GPU in chunks of whole heads. On OOM the chunk is halved and the smaller size is kept until the model reloads; attention fails with an out-of-memory error if a single head doesn't fit. Requires Comfy Kitchen attention.
   - Weights stay where they were loaded (GGUF memory-mapped on disk, safetensors in RAM) and are prepared on the donor one layer at a time. The compute GPU holds no weights, only GEMM tiles and attention chunks. The allocation only selects the donor (the first GPU donor listed).
   - ComfyUI quantized safetensors layers (int8, fp8) send their packed weight to the compute GPU and run their own quantized matmul there.
   - Plain LoRAs on GGUF models run as two thin GEMMs on the compute GPU instead of being merged into the dequantized weight on every call. DoRA, LoCon and other patch types are still merged.
-  - Conv2d and Conv3d: the compute GPU receives only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). Grouped convs also run on the compute GPU through the streaming above.
-  - With `VAELoaderDisTorch2MultiGPU`, image and video VAE encode/decode keep activations on the donor with all compute on the compute GPU. VAEs don't require Comfy Kitchen attention.
+  - Conv2d and Conv3d: the compute GPU receives only the input each tile needs, in tiles of at most 128 MiB split across height (and frames for Conv3d). fp16 convs that ComfyUI would run on Comfy Kitchen's implicit-GEMM conv (`gfx1010`, `gfx90c`) run their tiles on it (about 2.5× MIOpen), with larger tiles since it needs no im2col workspace. Grouped convs also run on the compute GPU through the streaming above.
+  - VAEs don't use mixed execution: `VAELoaderDisTorch2MultiGPU` keeps the weights where the allocation puts them (the donor, with a large `virtual_vram_gb`) and casts each layer to the compute GPU, where encode/decode and their activations run. Keeping VAE activations on the donor hit GPU memory faults during MiniMax H3 decode. VAEs that decode in tiles bound the compute GPU's activation memory; MiniMax H3 writes finished tiles to system RAM.
 
 - **`mixed_int8`**: `mixed`, plus a one-time conversion at load of every linear (GGUF Q4/Q5/Q8 and others, fp16/bf16 safetensors) to ComfyUI's int8 ConvRot layout, run with Comfy Kitchen's int8 GEMM. Requires Comfy Kitchen attention.
   - The int8 weights live in system RAM (about 1 byte per weight, roughly twice a Q4 model) while the model is loaded or cached. The donor keeps only activations, so it has more room than in `mixed`, and quantizes one layer at a time at load.
@@ -80,7 +80,7 @@ Donor execution trades PCIe transfer bandwidth and latency for lower peak VRAM o
   - Reloading with the same LoRAs reuses the converted weights; changing LoRAs converts again.
   - Requantizing a GGUF weight adds a second rounding on top of its own quantization.
   - Plain LoRAs, linears whose input features aren't a multiple of 256, and convs run at full precision as in `mixed`.
-  - VAEs convert their linears too, and their attention (including MiniMax H3's direct Kitchen int8 attention for int8 weights) runs on the compute GPU in chunks of frames or heads, with ComfyUI's selected attention (Comfy Kitchen) where the head dim is at most 256 and PyTorch SDPA otherwise. Everything else is streamed as in `mixed`. On the RX 5600M + Vega APU pair: MiniMax H3 decode 13.5 s → 4.8 s (17 frames, 256²), Flux encode 5.0 s → 3.7 s and decode 8.2 s → 6.9 s (1024², identical output), Wan 2.1 encode 36.9 s → 34.5 s (17 frames, 480×832).
+  - VAEs are not converted and run as described under `mixed`. A VAE stored as int8 still runs its own int8 kernels.
 
 - **`all`**: every eligible donor-resident linear GEMM runs entirely on the donor. A crude SLI/Crossfire for inference; best with a roughly 50/50 split on identical or similar GPUs (for example 2× RX 5700 XT or 2× Radeon VII). Only this mode pins the original CPU weights, since only donor GEMMs read host memory directly.
 

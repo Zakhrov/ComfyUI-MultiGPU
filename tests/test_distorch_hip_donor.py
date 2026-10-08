@@ -27,12 +27,17 @@ def load_distorch_module():
     model_patcher = types.ModuleType("comfy.model_patcher")
     quant_ops = types.ModuleType("comfy.quant_ops")
     quant_ops.QuantizedTensor = type("QuantizedTensor", (torch.Tensor,), {})
+    ops = types.ModuleType("comfy.ops")
+    ops.dense_linear = functional.linear
+    ops._packed_conv_wanted = lambda *_: False
     comfy.model_management = model_management
     comfy.model_patcher = model_patcher
+    comfy.ops = ops
     sys.modules["comfy"] = comfy
     sys.modules["comfy.model_management"] = model_management
     sys.modules["comfy.model_patcher"] = model_patcher
     sys.modules["comfy.quant_ops"] = quant_ops
+    sys.modules["comfy.ops"] = ops
 
     device_utils = types.ModuleType(f"{package_name}.device_utils")
     device_utils.get_device_list = lambda: ["cpu"]
@@ -291,6 +296,39 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(output, expected, atol=1e-5))
 
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_mixed_conv3d_tiles_run_on_kitchen_conv(self):
+        import comfy_kitchen
+
+        donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
+        module = torch.nn.Conv3d(64, 40, 3, stride=(1, 2, 2), padding=1).half().requires_grad_(False)
+        input_tensor = torch.randn(1, 64, 5, 18, 14, dtype=torch.float16)
+        expected = functional.conv3d(input_tensor.to(compute), module.weight.to(compute), module.bias.to(compute),
+                                     stride=(1, 2, 2), padding=1)
+        packed_on, kitchen_padding = [], []
+
+        def dense_conv(x, weight, bias, stride, padding):
+            kitchen_padding.append(padding)
+            return comfy_kitchen.fp16_conv3d(x, weight, bias, stride=stride, padding=padding)
+
+        module.to(donor)
+        self.assertTrue(self.distorch.configure_mixed_gemm(module, compute, donor))
+        with (
+            mock.patch.object(self.distorch.comfy.ops, "_packed_conv_wanted",
+                              lambda conv, x, weight: packed_on.append(weight.device) or True),
+            mock.patch.object(self.distorch.comfy.ops, "dense_conv", dense_conv, create=True),
+            mock.patch.object(self.distorch, "_CONV_TILE_BUDGET_BYTES", 1 << 18),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 40),
+        ):
+            output = module(input_tensor.to(donor))
+
+        self.assertEqual(packed_on, [compute])
+        self.assertGreater(len(kitchen_padding), 1)
+        self.assertEqual(set(kitchen_padding), {(0, 0, 0)})
+        self.assertEqual(output.device, donor)
+        error = (output.to(compute).float() - expected.float()).norm() / expected.float().norm()
+        self.assertLess(error.item(), 2e-3)
+
     def test_mixed_gemm_rejects_grouped_conv(self):
         with self.assertLogs("MultiGPU", level="INFO"):
             self.assertFalse(
@@ -298,180 +336,6 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                     torch.nn.Conv2d(2, 2, 3, padding=1, groups=2), "cuda:0", "cuda:1"
                 )
             )
-
-    def test_mixed_vae_runs_encode_and_decode_on_donor(self):
-        calls = []
-
-        class VAEModel(torch.nn.Module):
-            def encode(self, x, device=None):
-                calls.append(device)
-                return x * 2
-
-            def decode(self, z, output_buffer=None):
-                output_buffer.copy_(z + 1)
-                return output_buffer
-
-        model = VAEModel()
-        output_buffer = torch.empty(2)
-        self.distorch.configure_mixed_vae(model, "cpu", "cpu")
-
-        self.assertTrue(torch.equal(model.encode(torch.ones(2), device="meta"), torch.full((2,), 2.0)))
-        self.assertIs(model.decode(torch.ones(2), output_buffer=output_buffer), output_buffer)
-        self.assertEqual(calls, [torch.device("cpu")])
-        self.assertTrue(torch.equal(output_buffer, torch.full((2,), 2.0)))
-
-    def test_mixed_vae_does_not_require_comfy_kitchen_attention(self):
-        with mock.patch.object(
-            self.distorch, "_is_hip_software_gemm_device", return_value=True
-        ):
-            donor = self.distorch.select_mixed_donor_device(
-                object(), {"a": "cuda:0", "b": "cuda:1"}, "cuda:0", is_vae=True
-            )
-
-        self.assertEqual(donor, torch.device("cuda:1"))
-
-    def test_mixed_vae_runs_attention_on_compute_with_frames_as_heads(self):
-        self.check_mixed_int8_vae_attention(False, ((2, 4, 3, 3), "optimized"), ((1, 257, 2, 2), "pytorch"))
-
-    def test_mixed_int8_vae_routes_direct_kitchen_int8_attention_to_compute(self):
-        heads_seen = []
-
-        def int8_attention(q, k, v, *, scale=None, attn_mask=None):
-            heads_seen.append(q.shape[1])
-            return functional.scaled_dot_product_attention(q, k, v)
-
-        kitchen = types.ModuleType("comfy_kitchen")
-        kitchen.int8_attention = int8_attention
-
-        class VAEModel(torch.nn.Module):
-            def decode(self, q, k, v):
-                return kitchen.int8_attention(q, k, v)
-
-        model = VAEModel()
-        q, k, v = (torch.randn(1, 2, 5, 4) for _ in range(3))
-        with (
-            mock.patch.dict(sys.modules, {kitchen.__name__: kitchen}),
-            mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
-            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
-            mock.patch.object(self.distorch, "_int8_kitchen_attention", lambda func, device: func),
-        ):
-            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
-            output = model.decode(q, k, v)
-            outside = kitchen.int8_attention(q, k, v)
-
-        expected = functional.scaled_dot_product_attention(q, k, v)
-        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
-        self.assertTrue(torch.equal(outside, expected))
-        self.assertEqual(heads_seen, [1, 1, 2])
-
-    def test_int8_weights_are_detected_from_quant_format(self):
-        model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
-        algos = {"int8_tensorwise": {"storage_t": torch.int8}, "float8_e4m3fn": {"storage_t": torch.float8_e4m3fn}}
-        with mock.patch.object(sys.modules["comfy.quant_ops"], "QUANT_ALGOS", algos, create=True):
-            model[0].quant_format = "float8_e4m3fn"
-            self.assertFalse(self.distorch._has_int8_weights(model))
-            model[1].quant_format = "int8_tensorwise"
-            self.assertTrue(self.distorch._has_int8_weights(model))
-
-    def test_mixed_int8_vae_uses_kitchen_int8_attention_up_to_256_head_dim(self):
-        self.check_mixed_int8_vae_attention(True, ((2, 4, 3, 3), "int8"), ((1, 257, 2, 2), "pytorch"))
-
-    def check_mixed_int8_vae_attention(self, int8_available, *cases):
-        calls = []
-
-        def attention(name):
-            def run(q, k, v, heads, mask=None, skip_reshape=False, skip_output_reshape=False):
-                calls.append((name, heads))
-                return functional.scaled_dot_product_attention(q, k, v)
-
-            return run
-
-        attention_module = types.ModuleType("comfy.ldm.modules.attention")
-        attention_module.optimized_attention = attention("optimized")
-        attention_module.attention_pytorch = attention("pytorch")
-        attention_module.attention_comfy_kitchen_int8 = attention("int8")
-        attention_module.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = int8_available
-        kitchen = types.ModuleType("comfy_kitchen")
-        kitchen.int8_attention_is_available = lambda device: True
-        kitchen.int8_attention = lambda *_, **__: None
-        class VAEModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.block = torch.nn.Module()
-                self.block.optimized_attention = None
-
-            def encode(self, q, k, v):
-                return self.block.optimized_attention(q, k, v)
-
-        model = VAEModel()
-        with mock.patch.dict(sys.modules, {kitchen.__name__: kitchen}):
-            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=int8_available)
-
-        # Kitchen attention takes head dims up to 256; VAE heads span all channels.
-        for shape, name in cases:
-            q, k, v = (torch.randn(shape) for _ in range(3))
-            calls.clear()
-            with (
-                mock.patch.dict(
-                    sys.modules,
-                    {attention_module.__name__: attention_module, kitchen.__name__: kitchen},
-                ),
-                mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
-                mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
-            ):
-                output = model.encode(q, k, v)
-
-            q, k, v = (t.reshape(shape[0], 1, shape[1], -1).transpose(2, 3) for t in (q, k, v))
-            expected = functional.scaled_dot_product_attention(q, k, v).transpose(2, 3).reshape(shape)
-            self.assertTrue(torch.allclose(output, expected, atol=1e-5))
-            self.assertEqual(calls, shape[0] * [(name, 1)])
-
-    def test_mixed_int8_vae_routes_direct_attention_calls_to_compute(self):
-        heads_seen = []
-
-        def attention(q, k, v, heads, mask=None, skip_reshape=False, skip_output_reshape=False):
-            heads_seen.append(heads)
-            out = functional.scaled_dot_product_attention(q, k, v)
-            return out if skip_output_reshape else out.transpose(1, 2).flatten(2)
-
-        vae_module = types.ModuleType("mgpu_test_vae")
-        vae_module.optimized_attention = attention
-        attention_module = types.ModuleType("comfy.ldm.modules.attention")
-        attention_module.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = False
-        attention_module.attention_comfy_kitchen_int8 = None
-        kitchen = types.ModuleType("comfy_kitchen")
-        kitchen.int8_attention_is_available = lambda device: True
-        kitchen.int8_attention = lambda *_, **__: None
-
-        class VAEModel(torch.nn.Module):
-            __module__ = vae_module.__name__
-
-            def decode(self, q, k, v):
-                return vae_module.optimized_attention(q, k, v, 2, skip_reshape=True)
-
-        model = VAEModel()
-        q, k, v = (torch.randn(1, 2, 5, 4) for _ in range(3))
-        with (
-            mock.patch.dict(
-                sys.modules,
-                {
-                    vae_module.__name__: vae_module,
-                    attention_module.__name__: attention_module,
-                    kitchen.__name__: kitchen,
-                },
-            ),
-            mock.patch.object(self.distorch, "_ATTENTION_RESERVE_BYTES", 0),
-            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 30),
-        ):
-            self.distorch.configure_mixed_vae(model, "cpu", "cpu", int8=True)
-            output = model.decode(q, k, v)
-            outside = vae_module.optimized_attention(q, k, v, 2, skip_reshape=True)
-
-        expected = attention(q, k, v, 2, skip_reshape=True)
-        self.assertTrue(torch.allclose(output, expected, atol=1e-6))
-        self.assertTrue(torch.equal(outside, expected))
-        # The mixed call runs head chunks on the compute GPU; a call outside it runs unchanged.
-        self.assertEqual(heads_seen, [1, 1, 2, 2])
 
     def test_attention_chunks_heads_over_the_whole_sequence(self):
         q, k, v = (torch.randn(1, 2, 9, 4) for _ in range(3))
@@ -555,6 +419,19 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         self.assertTrue(torch.allclose(y.cpu(), expected, atol=1e-5))
         self.assertTrue(torch.equal(filled.cpu(), torch.full((3,), 2.0)))
 
+    def test_streamed_activations_allow_legacy_ctor_on_subclass(self):
+        class Quantized(torch.Tensor):
+            def __new__(cls, *args, tensor_type, **kwargs):
+                return super().__new__(cls, *args, **kwargs)
+
+            def __init__(self, *args, tensor_type, **kwargs):
+                super().__init__()
+
+        weight = Quantized(torch.ones(2), tensor_type=None)
+        with self.distorch._StreamedActivations("cpu", "cpu"):
+            plain = torch.Tensor(weight)
+        self.assertIs(type(plain), torch.Tensor)
+
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
     def test_streamed_activations_tile_ops_that_do_not_fit(self):
         donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
@@ -596,6 +473,43 @@ class TestHipDonorGemmOffload(unittest.TestCase):
             self.assertEqual(output.device, donor)
             self.assertTrue(torch.allclose(output.cpu().float(), reference.float(), atol=1e-4, rtol=1e-4))
         self.assertTrue({"aten::_softmax", "aten::native_layer_norm", "aten::bmm", "aten::cat", "aten::mean", "aten::mul_"} <= set(tiled))
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
+    def test_streamed_activations_tile_fused_rope_on_packed_qkv(self):
+        import comfy_kitchen
+
+        donor, compute = torch.device("cuda:1"), torch.device("cuda:0")
+        qkv = torch.randn(2, 12, 3, 4, 16)
+        freqs_cis = torch.randn(2, 12, 1, 8, 2, 2)
+        scale = torch.rand(16) + 0.5
+
+        def run(qkv, freqs_cis, scale):
+            q, k = qkv[:, :, 0], qkv[:, :, 1]
+            torch.ops.comfy_kitchen.rms_rope_split_half_(q, k, freqs_cis, scale, scale)
+            return q, k
+
+        expected = run(qkv.clone().to(compute), freqs_cis.to(compute), scale.to(compute))
+        tiled = []
+        original = self.distorch._StreamedActivations._tiled
+
+        def spy(mode, func, *args):
+            tiled.append(func._schema.name)
+            return original(mode, func, *args)
+
+        packed = qkv.to(donor)
+        with (
+            mock.patch.object(self.distorch, "_STREAM_DIRECT_BYTES", 100),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: self.distorch._COMPUTE_GPU_RESERVE_BYTES + 6000),
+            mock.patch.object(self.distorch._StreamedActivations, "_tiled", spy),
+            self.distorch._StreamedActivations(donor, compute),
+        ):
+            actual = run(packed, freqs_cis.to(donor), scale.to(donor))
+
+        self.assertIn("comfy_kitchen::rms_rope_split_half_", tiled)
+        for output, reference in zip(actual, expected):
+            self.assertEqual(output.device, donor)
+            self.assertTrue(torch.allclose(output.cpu(), reference.cpu(), atol=1e-5, rtol=1e-5))
+        self.assertTrue(torch.equal(packed[:, :, 2].cpu(), qkv[:, :, 2]))
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
     def test_streamed_activations_report_ops_that_cannot_be_tiled(self):
@@ -843,6 +757,39 @@ class TestHipDonorGemmOffload(unittest.TestCase):
         expected = functional.linear(
             input_tensor, module.weight + 1 + 0.5 * (up @ down), module.bias
         )
+        self.assertTrue(torch.allclose(output, expected, atol=1e-5))
+
+    def test_mixed_linear_unfolds_fused_prologue_and_residual(self):
+        """Linear(x, input_act=..., residual=...) keeps its GEMM on the compute path."""
+        module = torch.nn.Linear(3, 5).requires_grad_(False)
+        norm = torch.rand(3) + 0.5
+        ops = types.ModuleType("comfy.ops")
+        ops._eager_input_act = lambda x, input_act, act_weight: functional.rms_norm(x, (3,), act_weight)
+        ops._linear_residual = lambda out, residual, scale: torch.addcmul(residual, out, scale)
+        ops.dense_linear = functional.linear
+        gemm_inputs = []
+        run_mixed_linear = self.distorch._run_mixed_linear
+
+        def spy(value, linear):
+            gemm_inputs.append(value)
+            return run_mixed_linear(value, linear)
+
+        input_tensor, residual, scale = torch.randn(2, 4, 3), torch.randn(2, 4, 5), torch.rand(5)
+        free_bytes = self.distorch._COMPUTE_GPU_RESERVE_BYTES + (1 << 20)
+        with (
+            mock.patch.dict(sys.modules, {"comfy.ops": ops}),
+            mock.patch.object(sys.modules["comfy"], "ops", ops, create=True),
+            mock.patch.object(self.distorch, "_run_mixed_linear", spy),
+            mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: free_bytes, create=True),
+        ):
+            self.assertTrue(self.distorch.configure_mixed_gemm(module, "cpu", "cpu"))
+            output = module(input_tensor, input_act="rms_norm", act_weight=norm,
+                            residual=residual, residual_scale=scale)
+
+        normed = functional.rms_norm(input_tensor, (3,), norm)
+        self.assertEqual(len(gemm_inputs), 1)
+        self.assertTrue(torch.allclose(gemm_inputs[0], normed))
+        expected = torch.addcmul(residual, functional.linear(normed, module.weight, module.bias), scale)
         self.assertTrue(torch.allclose(output, expected, atol=1e-5))
 
     @unittest.skipUnless(torch.cuda.is_available(), "weight prefetch uses CUDA streams")

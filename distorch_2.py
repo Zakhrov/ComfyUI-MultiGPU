@@ -4,7 +4,6 @@ Contains all safetensor related code for distributed memory management
 """
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import itertools
@@ -13,13 +12,13 @@ import torch
 import torch.utils._pytree as pytree
 import logging
 import re
-import sys
 from collections import defaultdict, namedtuple
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
 logger = logging.getLogger("MultiGPU")
 import comfy.model_management as mm
 import comfy.model_patcher
+import comfy.ops
 from .device_utils import get_device_list
 from .model_management_mgpu import multigpu_memory_log
 
@@ -155,6 +154,13 @@ def _tile_axes(func, args, kwargs, leaves):
             for d in range(ndim)
             if shape[d] > 1 and (stack or d != dim)
         ]
+    if name == "comfy_kitchen::rms_rope_split_half_":
+        q, k, freqs_cis = leaves[:3]
+        return [
+            (shape[d], [d, d, d if freqs_cis.shape[d] == shape[d] else None] + [None] * (len(leaves) - 3), d)
+            for d in range(3)
+            if shape[d] > 1 and k.shape[d] == shape[d]
+        ]
     if torch.Tag.reduction in func.tags:
         values = {
             argument.name: args[i] if i < len(args) else kwargs.get(argument.name, argument.default_value)
@@ -257,7 +263,11 @@ class _StreamedActivations(TorchDispatchMode):
             for index, (leaf, dim) in enumerate(zip(leaves, dims))
             if dim is None
         }
-        outputs = [leaves[0]] if mutating else []
+        written = sum(
+            argument.alias_info is not None and argument.alias_info.is_write and "Tensor" in str(argument.type)
+            for argument in func._schema.arguments
+        )
+        outputs = leaves[:written] if mutating else []
         progress = [0]
 
         def load(chunk):
@@ -281,7 +291,8 @@ class _StreamedActivations(TorchDispatchMode):
             for position, tile in zip(positions, tiles):
                 values[position] = tile
             tile_args, tile_kwargs = pytree.tree_unflatten(values, spec)
-            return func(*tile_args, **tile_kwargs)
+            result = func(*tile_args, **tile_kwargs)
+            return tiles[:written] if result is None else result
 
         def store(chunk, result):
             start, stop = chunk
@@ -291,8 +302,8 @@ class _StreamedActivations(TorchDispatchMode):
                     shape = list(tile.shape)
                     shape[out_dim] = extent
                     outputs.append(torch.empty(shape, dtype=tile.dtype, device=self.donor))
-            for output, tile in zip(outputs, results):
-                output.narrow(dims[0] if mutating else out_dim, start, stop - start).copy_(tile, non_blocking=True)
+            for index, (output, tile) in enumerate(zip(outputs, results)):
+                output.narrow(dims[index] if mutating else out_dim, start, stop - start).copy_(tile, non_blocking=True)
             progress[0] = stop
 
         while progress[0] < extent:
@@ -309,13 +320,17 @@ class _StreamedActivations(TorchDispatchMode):
         if self.compute.type == "cuda":
             torch.cuda.synchronize(self.compute)
         if mutating:
-            return args[0]
+            return args[0] if func._schema.returns else None
         return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         kind = self._kind(func)
         if kind == "metadata":
+            # Under a dispatch mode aten::alias keeps the input's subclass, which breaks
+            # torch.Tensor(subclass) for subclasses whose __init__ takes required kwargs (GGMLTensor).
+            if func is torch.ops.aten.alias.default:
+                return func(*args, **kwargs).as_subclass(torch.Tensor)
             return func(*args, **kwargs)
         target = kwargs.get("device")
         target = None if target is None else self._resolve(target)
@@ -538,7 +553,7 @@ def _token_chunks(tokens, token_bytes, budget):
 
 
 def _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up):
-    output_chunk = torch.nn.functional.linear(input_chunk, weight, bias)
+    output_chunk = comfy.ops.dense_linear(input_chunk, weight, bias)
     if lora_down is not None:
         output_chunk.addmm_(input_chunk @ lora_down.t(), lora_up.t())
     return output_chunk
@@ -658,15 +673,15 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
     return output.reshape(*input_tensor.shape[:-1], out_features)
 
 
-def _run_tiled_conv_on_compute(
-    input_tensor, weight, bias, stride, padding, dilation, compute_device
-):
+def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, compute_device):
     """Run a zero-padded conv2d or conv3d on the compute GPU in tiles.
 
     The input and output stay on the input's device. Every spatial dim but the
     width is tiled; each tile copies only the input it reads, including the
-    kernel halo, and padding is applied on the compute GPU.
+    kernel halo, and padding is applied on the compute GPU. Tiles run on
+    Kitchen's fp16 implicit-GEMM conv where ComfyUI would use it.
     """
+    stride, dilation = conv.stride, conv.dilation
     batch, channels, *size = input_tensor.shape
     out_channels, _, *kernel = weight.shape
     dims = len(size)
@@ -688,6 +703,12 @@ def _run_tiled_conv_on_compute(
         budget = min(budget, _compute_budget(compute_device))
 
     channels_per_tile = min(out_channels, max(1, budget // 2 // channel_bytes))
+    weight_buffer = torch.empty(
+        (channels_per_tile, *weight.shape[1:]), device=compute_device, dtype=weight.dtype
+    )
+    packed = comfy.ops._packed_conv_wanted(conv, input_tensor, weight_buffer)
+    # MIOpen may lower the conv to a GEMM over an im2col workspace; Kitchen's conv has none.
+    workspace = 0 if packed else weight[0].numel()
 
     def input_extent(chunk, dim):
         return (chunk[dim] - 1) * stride[dim] + span[dim]
@@ -699,10 +720,7 @@ def _run_tiled_conv_on_compute(
         output_elements = 1
         for length in chunk:
             output_elements *= length
-        # Includes an im2col workspace in case the backend lowers the conv to a GEMM.
-        return (
-            input_elements + (channels_per_tile + weight[0].numel()) * output_elements
-        ) * element_size
+        return (input_elements + (channels_per_tile + workspace) * output_elements) * element_size
 
     # Halve the largest tiled dim until a tile fits; halving keeps the number
     # of distinct tile shapes, and so backend kernel searches, small.
@@ -712,9 +730,6 @@ def _run_tiled_conv_on_compute(
         dim = max(range(dims - 1), key=lambda d: chunk[d])
         chunk[dim] = -(-chunk[dim] // 2)
 
-    weight_buffer = torch.empty(
-        (channels_per_tile, *weight.shape[1:]), device=compute_device, dtype=weight.dtype
-    )
     input_numel = channels
     for dim in range(dims):
         input_numel *= input_extent(chunk, dim)
@@ -724,7 +739,8 @@ def _run_tiled_conv_on_compute(
     resident = channels_per_tile == out_channels
     if resident:
         weight_buffer.copy_(weight, non_blocking=True)
-    conv = torch.nn.functional.conv3d if dims == 3 else torch.nn.functional.conv2d
+    conv_op = torch.nn.functional.conv3d if dims == 3 else torch.nn.functional.conv2d
+    no_padding = (0,) * dims
     tile_starts = [range(0, out_size[dim], chunk[dim]) for dim in range(dims)]
 
     with torch.cuda.device_of(input_buffer):
@@ -761,14 +777,12 @@ def _run_tiled_conv_on_compute(
                     if not resident:
                         weight_tile.copy_(weight[start:end], non_blocking=True)
                     target[1] = slice(start, end)
-                    output[tuple(target)].copy_(conv(
-                            input_tile,
-                            weight_tile,
-                            None if bias is None else bias[start:end],
-                            stride,
-                            0,
-                            dilation,
-                        ), non_blocking=True)
+                    bias_tile = None if bias is None else bias[start:end]
+                    if packed:
+                        result = comfy.ops.dense_conv(input_tile, weight_tile, bias_tile, stride, no_padding)
+                    else:
+                        result = conv_op(input_tile, weight_tile, bias_tile, stride, 0, dilation)
+                    output[tuple(target)].copy_(result, non_blocking=True)
 
     return output
 
@@ -1393,13 +1407,7 @@ def _configure_mixed_conv(module):
         if autopad == "causal_zero":
             weight = weight[:, :, -input.shape[2] :]
         output = _run_tiled_conv_on_compute(
-            input,
-            weight,
-            bias,
-            module.stride,
-            padding,
-            module.dilation,
-            module._mgpu_compute_device,
+            module, input, weight, bias, padding, module._mgpu_compute_device
         )
         module._mgpu_donor_gemm_calls += 1
         if module._mgpu_donor_gemm_calls == 1:
@@ -1412,6 +1420,10 @@ def _configure_mixed_conv(module):
         return output
 
     module._conv_forward = mixed_conv_forward
+
+
+# comfy.ops Linear.forward's fused prologue/epilogue arguments (see linear_input_act_).
+_LINEAR_FUSION_KWARGS = frozenset(("input_act", "act_weight", "residual", "residual_scale"))
 
 
 def configure_mixed_gemm(module, compute_device, donor_device, int8=False, schedule=None):
@@ -1455,8 +1467,13 @@ def configure_mixed_gemm(module, compute_device, donor_device, int8=False, sched
         module._mgpu_donor_gemm_calls = 0
 
         def mixed_forward(*args, **kwargs):
-            if len(args) != 1 or kwargs or not isinstance(args[0], torch.Tensor):
+            if len(args) != 1 or not isinstance(args[0], torch.Tensor) or kwargs.keys() - _LINEAR_FUSION_KWARGS:
                 return module._mgpu_original_forward(*args, **kwargs)
+            if kwargs:
+                # ComfyUI's fused prologue/epilogue kernels would run on the donor
+                # tensors; unfold them so the GEMM itself still goes to the compute GPU.
+                x = comfy.ops._eager_input_act(args[0], kwargs.get("input_act"), kwargs.get("act_weight"))
+                return comfy.ops._linear_residual(mixed_forward(x), kwargs.get("residual"), kwargs.get("residual_scale"))
             fused = module._mgpu_fused
             if fused is not None:
                 if module._mgpu_quantized:
@@ -1559,7 +1576,7 @@ def _mixed_weight_device(module, donor_device):
     return "cpu" if hasattr(module, "comfy_cast_weights") else donor_device
 
 
-def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=False):
+def select_mixed_donor_device(model, block_assignments, compute_device):
     """Pick the donor GPU that holds a mixed-mode model's activations, or None."""
     compute_device = torch.device(compute_device)
     donors = sorted(
@@ -1567,10 +1584,9 @@ def select_mixed_donor_device(model, block_assignments, compute_device, is_vae=F
         - {"cpu", str(compute_device)}
     )
     reasons = []
-    if not is_vae and not hasattr(model, "diffusion_model"):
-        reasons.append("model has no diffusion model or VAE")
-    # VAEs run whichever attention ComfyUI selected, so only diffusion models need Kitchen attention.
-    if not is_vae and not _is_comfy_kitchen_attention_enabled():
+    if not hasattr(model, "diffusion_model"):
+        reasons.append("model has no diffusion model")
+    if not _is_comfy_kitchen_attention_enabled():
         reasons.append("Comfy Kitchen attention is disabled")
     if not donors:
         reasons.append("allocation has no donor GPU")
@@ -1645,196 +1661,6 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
             len(schedule.mlp_linears),
             compute_device,
         )
-
-
-# (compute device, attention plan, int8) of the mixed VAE call running now.
-_vae_attention_target = contextvars.ContextVar("mgpu_vae_attention_target", default=None)
-# Modules whose optimized_attention global _route_attention_to_compute has wrapped.
-_routed_attention_modules = set()
-
-
-def _int8_kitchen_attention(func, compute_device):
-    """Comfy Kitchen int8 attention on the compute GPU for head dims up to 256, func otherwise."""
-    import comfy_kitchen
-    from comfy.ldm.modules.attention import (
-        COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE,
-        attention_comfy_kitchen_int8,
-    )
-
-    if not (
-        COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE
-        and comfy_kitchen.int8_attention_is_available(compute_device)
-    ):
-        return func
-
-    def attention(q, k, v, heads, *args, **kwargs):
-        dim_head = q.shape[-1] if kwargs.get("skip_reshape", False) else q.shape[-1] // heads
-        # An attention that fell back to the donor runs what ComfyUI selected.
-        if dim_head > 256 or q.device != compute_device:
-            return func(q, k, v, heads, *args, **kwargs)
-        return attention_comfy_kitchen_int8(q, k, v, heads, *args, **kwargs)
-
-    return attention
-
-
-def _vae_attention_on_compute(func, *args, **kwargs):
-    """Run attention on the compute GPU during a mixed VAE call, and where it is otherwise.
-
-    An int8 VAE (target[2]) uses Comfy Kitchen int8 attention there, whichever
-    attention ComfyUI selected; other VAEs keep the selected attention.
-    """
-    target = _vae_attention_target.get()
-    if target is None:
-        return func(*args, **kwargs)
-    if target[2]:
-        func = _int8_kitchen_attention(func, target[0])
-    # Attention that func calls in turn runs where func runs it.
-    token = _vae_attention_target.set(None)
-    try:
-        return _run_attention_on_compute(
-            func, *args, compute_device=target[0], plan=target[1], **kwargs
-        )
-    finally:
-        _vae_attention_target.reset(token)
-
-
-def _run_vae_block_attention(q, k, v):
-    """A vae_attention() block's single-head attention, through _vae_attention_on_compute.
-
-    VAE attention takes (batch, channels, *spatial) tensors with one head over
-    all channels. Batch items (frames, for video VAEs) are independent, so
-    they are passed as heads and their chunks pipeline through
-    _run_attention_on_compute.
-    """
-    from comfy.ldm.modules.attention import attention_pytorch, optimized_attention
-
-    shape = q.shape
-    q, k, v = (
-        tensor.reshape(shape[0], shape[1], -1).transpose(1, 2).contiguous().unsqueeze(0)
-        for tensor in (q, k, v)
-    )
-    # Comfy Kitchen attention takes head dims up to 256.
-    func = optimized_attention if shape[1] <= 256 else attention_pytorch
-    output = _vae_attention_on_compute(
-        func, q, k, v, shape[0], skip_reshape=True, skip_output_reshape=True
-    )
-    return output[0].transpose(1, 2).reshape(shape)
-
-
-def _route_attention_to_compute(module_name):
-    """Send a model module's direct optimized_attention calls through _vae_attention_on_compute.
-
-    Transformer VAE decoders such as MiniMax H3's call the attention function
-    they imported instead of a vae_attention() block.
-    """
-    if module_name in _routed_attention_modules:
-        return
-    _routed_attention_modules.add(module_name)
-    module_globals = vars(sys.modules[module_name])
-    attention = module_globals.get("optimized_attention")
-    if attention is not None:
-        module_globals["optimized_attention"] = functools.partial(
-            _vae_attention_on_compute, attention
-        )
-
-
-def _route_kitchen_int8_attention_to_compute():
-    """Send comfy_kitchen.int8_attention calls through _vae_attention_on_compute.
-
-    MiniMax H3's decoder calls it directly when its weights are already int8,
-    bypassing optimized_attention.
-    """
-    import comfy_kitchen
-
-    if hasattr(comfy_kitchen.int8_attention, "_mgpu_original"):
-        return
-    original = comfy_kitchen.int8_attention
-
-    def run_on_compute(q, k, v, heads, mask=None, skip_reshape=True, skip_output_reshape=True, **kwargs):
-        return original(q, k, v, attn_mask=mask, **kwargs)
-
-    @functools.wraps(original)
-    def int8_attention(q, k, v, *, scale=None, attn_mask=None):
-        if _vae_attention_target.get() is None:
-            return original(q, k, v, scale=scale, attn_mask=attn_mask)
-        return _vae_attention_on_compute(
-            run_on_compute, q, k, v, q.shape[1], attn_mask,
-            skip_reshape=True, skip_output_reshape=True, scale=scale,
-        )
-
-    int8_attention._mgpu_original = original
-    comfy_kitchen.int8_attention = int8_attention
-
-
-def _has_int8_weights(model):
-    """Whether any layer of a model is stored in an int8 quantization format."""
-    from comfy.quant_ops import QUANT_ALGOS
-
-    return any(
-        QUANT_ALGOS.get(getattr(module, "quant_format", None), {}).get("storage_t") == torch.int8
-        for module in model.modules()
-    )
-
-
-def configure_mixed_vae(vae_model, donor_device, compute_device, int8=False):
-    """Run VAE encode and decode on the donor; conv and linear GEMMs go to the compute GPU.
-
-    Activations, norms, upsampling and temporal caches stay on the donor, so
-    the compute GPU only holds conv tiles (see configure_mixed_gemm). Attention
-    also runs on the compute GPU (see _vae_attention_on_compute), as Kitchen
-    int8 attention with int8 (mixed_int8, or a VAE whose weights are already int8).
-    """
-    if not hasattr(vae_model, "_mgpu_original_methods"):
-        vae_model._mgpu_original_methods = {}
-
-        def donor_call(method):
-            def mixed_call(*args, **kwargs):
-                donor = vae_model._mgpu_donor_execution_device
-                compute = vae_model._mgpu_compute_device
-                output_device = _first_tensor(args).device
-                # Chunked-IO VAEs write straight into output_buffer and move
-                # their own chunks to the given device.
-                donor_kwargs = {
-                    key: value if key == "output_buffer" else _move_tensors(value, donor)
-                    for key, value in kwargs.items()
-                }
-                if "device" in kwargs:
-                    donor_kwargs["device"] = donor
-                donor_args = _move_tensors(args, donor)
-                token = _vae_attention_target.set(vae_model._mgpu_attention_target)
-                try:
-                    with _StreamedActivations(donor, compute), _current_device(compute):
-                        output = method(*donor_args, **donor_kwargs)
-                finally:
-                    _vae_attention_target.reset(token)
-                if output is kwargs.get("output_buffer"):
-                    return output
-                return _move_tensors(output, output_device)
-
-            return mixed_call
-
-        for name in ("encode", "decode", "encode_tiled", "decode_tiled"):
-            method = getattr(vae_model, name, None)
-            if callable(method):
-                vae_model._mgpu_original_methods[name] = method
-                setattr(vae_model, name, donor_call(method))
-        logger.info(
-            "[MultiGPU DisTorch V2] Mixed VAE execution: activations on %s, all compute on %s",
-            donor_device,
-            compute_device,
-        )
-
-    vae_model._mgpu_donor_execution_device = torch.device(donor_device)
-    vae_model._mgpu_compute_device = torch.device(compute_device)
-    # Attention chunk sizes learned from OOMs are kept until the next load.
-    vae_model._mgpu_attention_target = (torch.device(compute_device), {}, int8)
-    if int8:
-        _route_kitchen_int8_attention_to_compute()
-    for module in vae_model.modules():
-        # ComfyUI's VAE attention blocks call the vae_attention() they store as optimized_attention.
-        if hasattr(module, "optimized_attention"):
-            module.optimized_attention = _run_vae_block_attention
-        _route_attention_to_compute(type(module).__module__)
 
 
 def configure_hip_donor_gemm_offload(
@@ -2250,7 +2076,9 @@ def register_patched_safetensor_modelpatcher():
             high_precision_loras = getattr(
                 self.model, "_distorch_high_precision_loras", True
             )
-            # DisTorch2 VAE loaders patch the VAE's first_stage_model directly.
+            # DisTorch2 VAE loaders patch the VAE's first_stage_model directly. A VAE's
+            # decode tiles already bound its activations, so it runs on the compute GPU
+            # with its weights where the allocation put them instead of in mixed mode.
             is_vae = (
                 not is_clip_model
                 and not hasattr(self.model, "diffusion_model")
@@ -2260,12 +2088,11 @@ def register_patched_safetensor_modelpatcher():
             mixed_int8 = donor_gemm_execution_mode == "mixed_int8"
             int8_layers = 0
             schedule = None
-            if donor_gemm_execution_mode in ("mixed", "mixed_int8"):
+            if donor_gemm_execution_mode in ("mixed", "mixed_int8") and not is_vae:
                 mixed_donor_device = select_mixed_donor_device(
                     self.model,
                     device_assignments["block_assignments"],
                     device_to,
-                    is_vae,
                 )
             # Mixed mode keeps activations on the donor, so weights stored anywhere
             # else are cast to it at runtime.
@@ -2275,15 +2102,9 @@ def register_patched_safetensor_modelpatcher():
                     "[MultiGPU DisTorch V2] Mixed mode: %s holds activations; weights stay in system RAM or memory-mapped on disk",
                     mixed_donor_device,
                 )
-                if not is_vae:
-                    schedule = _MixedSchedule(device_to, mixed_donor_device)
+                schedule = _MixedSchedule(device_to, mixed_donor_device)
                 if mixed_int8:
-                    # A VAE has no inference dtype of its own; its weights are stored in it.
-                    if is_vae:
-                        float_sd = {k: v for k, v in self.model.state_dict().items() if v.dtype.is_floating_point}
-                        int8_dtype = comfy.utils.weight_dtype(float_sd)
-                    else:
-                        int8_dtype = self.model.get_dtype_inference()
+                    int8_dtype = self.model.get_dtype_inference()
 
             def prepare_int8(module_object, module_name):
                 keys = [f"{module_name}._mgpu_int8_weight", f"{module_name}._mgpu_int8_bias"]
@@ -2475,14 +2296,7 @@ def register_patched_safetensor_modelpatcher():
                     int8_layers,
                     mixed_donor_device,
                 )
-            if mixed_donor_device is not None and is_vae:
-                configure_mixed_vae(
-                    self.model,
-                    mixed_donor_device,
-                    device_to,
-                    mixed_int8 or _has_int8_weights(self.model),
-                )
-            elif mixed_donor_device is not None:
+            if mixed_donor_device is not None:
                 configure_mixed_execution(
                     self.model.diffusion_model, mixed_donor_device, device_to, schedule
                 )
