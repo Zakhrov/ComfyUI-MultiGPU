@@ -38,15 +38,6 @@ def _create_distorch_safetensor_v2_override(
                 devices,
                 {"default": default_device},
             )
-            inputs["optional"]["virtual_vram_gb"] = (
-                "FLOAT",
-                {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
-            )
-            inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
-            inputs["optional"]["expert_mode_allocations"] = (
-                "STRING",
-                {"multiline": False, "default": ""},
-            )
             inputs["optional"]["eject_models"] = (
                 "BOOLEAN",
                 {"default": eject_models_default},
@@ -61,14 +52,11 @@ def _create_distorch_safetensor_v2_override(
         def IS_CHANGED(
             s,
             *args,
-            virtual_vram_gb=4.0,
-            donor_device="cpu",
-            expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
         ):
             device_value = kwargs.get(device_param_name)
-            settings_str = f"{device_value}{virtual_vram_gb}{donor_device}{expert_mode_allocations}{eject_models}"
+            settings_str = f"{device_value}{eject_models}"
             current_hash = hashlib.sha256(settings_str.encode()).hexdigest()
 
             if not hasattr(cls, "_last_hash"):
@@ -84,9 +72,6 @@ def _create_distorch_safetensor_v2_override(
         def override(
             self,
             *args,
-            virtual_vram_gb=4.0,
-            donor_device="cpu",
-            expert_mode_allocations="",
             eject_models=eject_models_default,
             **kwargs,
         ):
@@ -141,36 +126,15 @@ def _create_distorch_safetensor_v2_override(
             if device_value is not None:
                 device_setter_func(device_value)
 
-            # Strip MultiGPU-specific parameters before calling original function (REMOVE eject_models, eject_models and virtual_vram_gb since we handle them above)
+            # Strip MultiGPU-specific parameters before calling original function
             clean_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in [
-                    device_param_name,
-                    "virtual_vram_gb",
-                    "donor_device",
-                    "expert_mode_allocations",
-                    "eject_models",
-                ]
+                k: v for k, v in kwargs.items() if k not in [device_param_name, "eject_models"]
             }
 
             if apply_device_kwarg_workaround:
                 clean_kwargs["device"] = "default"
 
             register_patched_safetensor_modelpatcher()
-
-            vram_string = ""
-            if virtual_vram_gb > 0:
-                vram_string = f"{device_value};{virtual_vram_gb};{donor_device}"
-            elif expert_mode_allocations:
-                vram_string = device_value
-
-            full_allocation = (
-                f"{expert_mode_allocations}#{vram_string}"
-                if expert_mode_allocations or vram_string
-                else ""
-            )
 
             fn = getattr(super(), cls.FUNCTION)
             out = fn(*args, **clean_kwargs)
@@ -181,13 +145,9 @@ def _create_distorch_safetensor_v2_override(
             elif hasattr(out[0], "patcher") and hasattr(out[0].patcher, "model"):
                 model_to_check = out[0].patcher
 
-            if model_to_check and full_allocation:
-                inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
-
-            logger.info(
-                f"[MultiGPU DisTorch V2] Full allocation string: {full_allocation}"
-            )
+            if model_to_check:
+                # DisTorch places the weights itself when the model loads (see distorch_2).
+                model_to_check.model._distorch_v2_meta = {"eject_models": eject_models}
 
             try:
                 return out
@@ -254,15 +214,6 @@ def override_class_with_distorch_gguf(cls):
             default_device = devices[1] if len(devices) > 1 else devices[0]
             inputs["optional"] = inputs.get("optional", {})
             inputs["optional"]["device"] = (devices, {"default": default_device})
-            inputs["optional"]["virtual_vram_gb"] = (
-                "FLOAT",
-                {"default": 4.0, "min": 0.0, "max": 24.0, "step": 0.1},
-            )
-            inputs["optional"]["use_other_vram"] = ("BOOLEAN", {"default": False})
-            inputs["optional"]["expert_mode_allocations"] = (
-                "STRING",
-                {"multiline": False, "default": ""},
-            )
             return inputs
 
         CATEGORY = "multigpu/legacy"
@@ -273,9 +224,6 @@ def override_class_with_distorch_gguf(cls):
             self,
             *args,
             device=None,
-            expert_mode_allocations="",
-            use_other_vram=False,
-            virtual_vram_gb=0.0,
             **kwargs,
         ):
             # Capture and restore the current device to avoid leaking global state
@@ -284,39 +232,9 @@ def override_class_with_distorch_gguf(cls):
                 set_current_device(device)
 
             # Strip MultiGPU-specific parameters before calling original function
-            clean_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in [
-                    "device",
-                    "virtual_vram_gb",
-                    "use_other_vram",
-                    "expert_mode_allocations",
-                ]
-            }
+            clean_kwargs = {k: v for k, v in kwargs.items() if k != "device"}
 
             register_patched_safetensor_modelpatcher()
-
-            vram_string = ""
-            if virtual_vram_gb > 0:
-                if use_other_vram:
-                    available_devices = [d for d in get_device_list() if d != "cpu"]
-                    other_devices = [d for d in available_devices if d != device]
-                    other_devices.sort(
-                        key=lambda x: int(x.split(":")[1] if ":" in x else x[-1]),
-                        reverse=False,
-                    )
-                    device_string = ",".join(other_devices + ["cpu"])
-                    vram_string = f"{device};{virtual_vram_gb};{device_string}"
-                else:
-                    vram_string = f"{device};{virtual_vram_gb};cpu"
-
-            full_allocation = (
-                f"{expert_mode_allocations}#{vram_string}"
-                if expert_mode_allocations or vram_string
-                else ""
-            )
 
             fn = getattr(super(), cls.FUNCTION)
             out = fn(*args, **clean_kwargs)
@@ -327,111 +245,14 @@ def override_class_with_distorch_gguf(cls):
             elif hasattr(out[0], "patcher") and hasattr(out[0].patcher, "model"):
                 model_to_check = out[0].patcher
 
-            if model_to_check and full_allocation:
-                inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
+            if model_to_check:
+                model_to_check.model._distorch_v2_meta = {"eject_models": False}
             try:
                 return out
             finally:
                 set_current_device(original_device)
 
     return NodeOverrideDisTorchGGUFLegacy
-
-
-def override_class_with_distorch_gguf_v2(cls):
-    """DisTorch V2 wrapper for GGUF models"""
-    from . import set_current_device, get_current_device
-    from .distorch_2 import register_patched_safetensor_modelpatcher
-
-    class NodeOverrideDisTorchGGUFv2(cls):
-        @classmethod
-        def INPUT_TYPES(s):
-            inputs = copy.deepcopy(cls.INPUT_TYPES())
-            devices = get_device_list()
-            compute_device = devices[1] if len(devices) > 1 else devices[0]
-
-            inputs["optional"] = inputs.get("optional", {})
-            inputs["optional"]["compute_device"] = (
-                devices,
-                {"default": compute_device},
-            )
-            inputs["optional"]["virtual_vram_gb"] = (
-                "FLOAT",
-                {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
-            )
-            inputs["optional"]["donor_device"] = (devices, {"default": "cpu"})
-            inputs["optional"]["expert_mode_allocations"] = (
-                "STRING",
-                {"multiline": False, "default": ""},
-            )
-            return inputs
-
-        CATEGORY = "multigpu/distorch_2"
-        FUNCTION = "override"
-        TITLE = f"{cls.TITLE if hasattr(cls, 'TITLE') else cls.__name__} (DisTorch2)"
-
-        def override(
-            self,
-            *args,
-            compute_device=None,
-            virtual_vram_gb=4.0,
-            donor_device="cpu",
-            expert_mode_allocations="",
-            **kwargs,
-        ):
-            original_device = get_current_device()
-            if compute_device is not None:
-                set_current_device(compute_device)
-
-            # Strip MultiGPU-specific parameters before calling original function
-            clean_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in [
-                    "compute_device",
-                    "virtual_vram_gb",
-                    "donor_device",
-                    "expert_mode_allocations",
-                ]
-            }
-
-            register_patched_safetensor_modelpatcher()
-
-            vram_string = ""
-            if virtual_vram_gb > 0:
-                vram_string = f"{compute_device};{virtual_vram_gb};{donor_device}"
-            elif expert_mode_allocations:
-                vram_string = compute_device
-
-            full_allocation = (
-                f"{expert_mode_allocations}#{vram_string}"
-                if expert_mode_allocations or vram_string
-                else ""
-            )
-
-            logger.info(
-                f"[MultiGPU DisTorch V2] Full allocation string: {full_allocation}"
-            )
-
-            fn = getattr(super(), cls.FUNCTION)
-            out = fn(*args, **clean_kwargs)
-
-            model_to_check = None
-            if hasattr(out[0], "model"):
-                model_to_check = out[0]
-            elif hasattr(out[0], "patcher") and hasattr(out[0].patcher, "model"):
-                model_to_check = out[0].patcher
-
-            if model_to_check and full_allocation:
-                inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
-            try:
-                return out
-            finally:
-                set_current_device(original_device)
-
-    return NodeOverrideDisTorchGGUFv2
 
 
 def override_class_with_distorch_clip(cls):
@@ -447,15 +268,6 @@ def override_class_with_distorch_clip(cls):
             default_device = devices[1] if len(devices) > 1 else devices[0]
             inputs["optional"] = inputs.get("optional", {})
             inputs["optional"]["device"] = (devices, {"default": default_device})
-            inputs["optional"]["virtual_vram_gb"] = (
-                "FLOAT",
-                {"default": 4.0, "min": 0.0, "max": 24.0, "step": 0.1},
-            )
-            inputs["optional"]["use_other_vram"] = ("BOOLEAN", {"default": False})
-            inputs["optional"]["expert_mode_allocations"] = (
-                "STRING",
-                {"multiline": False, "default": ""},
-            )
             return inputs
 
         CATEGORY = "multigpu"
@@ -466,9 +278,6 @@ def override_class_with_distorch_clip(cls):
             self,
             *args,
             device=None,
-            expert_mode_allocations="",
-            use_other_vram=False,
-            virtual_vram_gb=0.0,
             **kwargs,
         ):
             original_text_device = get_current_text_encoder_device()
@@ -476,39 +285,9 @@ def override_class_with_distorch_clip(cls):
                 set_current_text_encoder_device(device)
 
             # Strip MultiGPU-specific parameters before calling original function
-            clean_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in [
-                    "device",
-                    "virtual_vram_gb",
-                    "use_other_vram",
-                    "expert_mode_allocations",
-                ]
-            }
+            clean_kwargs = {k: v for k, v in kwargs.items() if k != "device"}
 
             register_patched_safetensor_modelpatcher()
-
-            vram_string = ""
-            if virtual_vram_gb > 0:
-                if use_other_vram:
-                    available_devices = [d for d in get_device_list() if d != "cpu"]
-                    other_devices = [d for d in available_devices if d != device]
-                    other_devices.sort(
-                        key=lambda x: int(x.split(":")[1] if ":" in x else x[-1]),
-                        reverse=False,
-                    )
-                    device_string = ",".join(other_devices + ["cpu"])
-                    vram_string = f"{device};{virtual_vram_gb};{device_string}"
-                else:
-                    vram_string = f"{device};{virtual_vram_gb};cpu"
-
-            full_allocation = (
-                f"{expert_mode_allocations}#{vram_string}"
-                if expert_mode_allocations or vram_string
-                else ""
-            )
 
             fn = getattr(super(), cls.FUNCTION)
             out = fn(*args, **clean_kwargs)
@@ -519,9 +298,8 @@ def override_class_with_distorch_clip(cls):
             elif hasattr(out[0], "patcher") and hasattr(out[0].patcher, "model"):
                 model_to_check = out[0].patcher
 
-            if model_to_check and full_allocation:
-                inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
+            if model_to_check:
+                model_to_check.model._distorch_v2_meta = {"eject_models": False}
             try:
                 return out
             finally:
@@ -543,15 +321,6 @@ def override_class_with_distorch_clip_no_device(cls):
             default_device = devices[1] if len(devices) > 1 else devices[0]
             inputs["optional"] = inputs.get("optional", {})
             inputs["optional"]["device"] = (devices, {"default": default_device})
-            inputs["optional"]["virtual_vram_gb"] = (
-                "FLOAT",
-                {"default": 4.0, "min": 0.0, "max": 24.0, "step": 0.1},
-            )
-            inputs["optional"]["use_other_vram"] = ("BOOLEAN", {"default": False})
-            inputs["optional"]["expert_mode_allocations"] = (
-                "STRING",
-                {"multiline": False, "default": ""},
-            )
             return inputs
 
         CATEGORY = "multigpu"
@@ -562,9 +331,6 @@ def override_class_with_distorch_clip_no_device(cls):
             self,
             *args,
             device=None,
-            expert_mode_allocations="",
-            use_other_vram=False,
-            virtual_vram_gb=0.0,
             **kwargs,
         ):
             original_text_device = get_current_text_encoder_device()
@@ -572,39 +338,9 @@ def override_class_with_distorch_clip_no_device(cls):
                 set_current_text_encoder_device(device)
 
             # Strip MultiGPU-specific parameters before calling original function
-            clean_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in [
-                    "device",
-                    "virtual_vram_gb",
-                    "use_other_vram",
-                    "expert_mode_allocations",
-                ]
-            }
+            clean_kwargs = {k: v for k, v in kwargs.items() if k != "device"}
 
             register_patched_safetensor_modelpatcher()
-
-            vram_string = ""
-            if virtual_vram_gb > 0:
-                if use_other_vram:
-                    available_devices = [d for d in get_device_list() if d != "cpu"]
-                    other_devices = [d for d in available_devices if d != device]
-                    other_devices.sort(
-                        key=lambda x: int(x.split(":")[1] if ":" in x else x[-1]),
-                        reverse=False,
-                    )
-                    device_string = ",".join(other_devices + ["cpu"])
-                    vram_string = f"{device};{virtual_vram_gb};{device_string}"
-                else:
-                    vram_string = f"{device};{virtual_vram_gb};cpu"
-
-            full_allocation = (
-                f"{expert_mode_allocations}#{vram_string}"
-                if expert_mode_allocations or vram_string
-                else ""
-            )
 
             fn = getattr(super(), cls.FUNCTION)
             out = fn(*args, **clean_kwargs)
@@ -615,9 +351,8 @@ def override_class_with_distorch_clip_no_device(cls):
             elif hasattr(out[0], "patcher") and hasattr(out[0].patcher, "model"):
                 model_to_check = out[0].patcher
 
-            if model_to_check and full_allocation:
-                inner_model = model_to_check.model
-                inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
+            if model_to_check:
+                model_to_check.model._distorch_v2_meta = {"eject_models": False}
             try:
                 return out
             finally:

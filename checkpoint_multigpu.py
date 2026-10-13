@@ -1,6 +1,5 @@
 import torch
 import logging
-import hashlib
 import comfy.sd
 import comfy.utils
 import comfy.model_management as mm
@@ -190,18 +189,18 @@ def patched_load_state_dict_guess_config(
             soft_empty_cache_multigpu()
             multigpu_memory_log(f"unet:{config_hash[:8]}", "post-model")
 
-            if distorch_config and "unet_allocation" in distorch_config:
-                unet_alloc = distorch_config["unet_allocation"]
-                if unet_alloc:
-                    register_patched_safetensor_modelpatcher()
-                    inner_model = model_patcher.model
-                    inner_model._distorch_v2_meta = {"full_allocation": unet_alloc}
-                    logger.info(
-                        f"[CHECKPOINT_META] UNET inner_model id=0x{id(inner_model):x}"
-                    )
-                    model._distorch_high_precision_loras = distorch_config.get(
-                        "high_precision_loras", True
-                    )
+            if distorch_config:
+                register_patched_safetensor_modelpatcher()
+                inner_model = model_patcher.model
+                inner_model._distorch_v2_meta = {
+                    "eject_models": distorch_config["eject_models"]
+                }
+                logger.info(
+                    f"[CHECKPOINT_META] UNET inner_model id=0x{id(inner_model):x}"
+                )
+                model._distorch_high_precision_loras = distorch_config.get(
+                    "high_precision_loras", True
+                )
 
         if output_vae:
             vae_target_device = torch.device(
@@ -266,18 +265,16 @@ def patched_load_state_dict_guess_config(
                         disable_dynamic=disable_dynamic,
                     )
 
-                    if distorch_config and "clip_allocation" in distorch_config:
-                        clip_alloc = distorch_config["clip_allocation"]
-                        if clip_alloc and hasattr(clip, "patcher"):
-                            register_patched_safetensor_modelpatcher()
-                            inner_clip = clip.patcher.model
-                            inner_clip._distorch_v2_meta = {"full_allocation": clip_alloc}
-                            logger.info(
-                                f"[CHECKPOINT_META] CLIP inner_model id=0x{id(inner_clip):x}"
-                            )
-                            clip.patcher.model._distorch_high_precision_loras = (
-                                distorch_config.get("high_precision_loras", True)
-                            )
+                    if distorch_config and hasattr(clip, "patcher"):
+                        register_patched_safetensor_modelpatcher()
+                        inner_clip = clip.patcher.model
+                        inner_clip._distorch_v2_meta = {"eject_models": False}
+                        logger.info(
+                            f"[CHECKPOINT_META] CLIP inner_model id=0x{id(inner_clip):x}"
+                        )
+                        clip.patcher.model._distorch_high_precision_loras = (
+                            distorch_config.get("high_precision_loras", True)
+                        )
 
                     logger.info("CLIP Loaded.")
                     multigpu_memory_log(f"clip:{config_hash[:8]}", "post-load")
@@ -353,28 +350,10 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
             "required": {
                 "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
                 "unet_compute_device": (devices, {"default": compute_device}),
-                "unet_virtual_vram_gb": (
-                    "FLOAT",
-                    {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.1},
-                ),
-                "unet_donor_device": (devices, {"default": "cpu"}),
                 "clip_compute_device": (devices, {"default": "cpu"}),
-                "clip_virtual_vram_gb": (
-                    "FLOAT",
-                    {"default": 2.0, "min": 0.0, "max": 128.0, "step": 0.1},
-                ),
-                "clip_donor_device": (devices, {"default": "cpu"}),
                 "vae_device": (devices, {"default": compute_device}),
             },
             "optional": {
-                "unet_expert_mode_allocations": (
-                    "STRING",
-                    {"multiline": False, "default": ""},
-                ),
-                "clip_expert_mode_allocations": (
-                    "STRING",
-                    {"multiline": False, "default": ""},
-                ),
                 "high_precision_loras": ("BOOLEAN", {"default": True}),
                 "eject_models": ("BOOLEAN", {"default": True}),
             },
@@ -389,14 +368,8 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
         self,
         ckpt_name,
         unet_compute_device,
-        unet_virtual_vram_gb,
-        unet_donor_device,
         clip_compute_device,
-        clip_virtual_vram_gb,
-        clip_donor_device,
         vae_device,
-        unet_expert_mode_allocations="",
-        clip_expert_mode_allocations="",
         high_precision_loras=True,
         eject_models=True,
     ):
@@ -444,42 +417,9 @@ class CheckpointLoaderAdvancedDisTorch2MultiGPU:
             "vae_device": vae_device,
         }
 
-        unet_vram_str = ""
-        if unet_virtual_vram_gb > 0:
-            unet_vram_str = (
-                f"{unet_compute_device};{unet_virtual_vram_gb};{unet_donor_device}"
-            )
-        elif unet_expert_mode_allocations:
-            unet_vram_str = unet_compute_device
-        unet_alloc = (
-            f"{unet_expert_mode_allocations}#{unet_vram_str}"
-            if unet_expert_mode_allocations or unet_vram_str
-            else ""
-        )
-
-        clip_vram_str = ""
-        if clip_virtual_vram_gb > 0:
-            clip_vram_str = (
-                f"{clip_compute_device};{clip_virtual_vram_gb};{clip_donor_device}"
-            )
-        elif clip_expert_mode_allocations:
-            clip_vram_str = clip_compute_device
-        clip_alloc = (
-            f"{clip_expert_mode_allocations}#{clip_vram_str}"
-            if clip_expert_mode_allocations or clip_vram_str
-            else ""
-        )
-
         checkpoint_distorch_config[config_hash] = {
-            "unet_allocation": unet_alloc,
-            "clip_allocation": clip_alloc,
+            "eject_models": eject_models,
             "high_precision_loras": high_precision_loras,
-            "unet_settings": hashlib.sha256(
-                f"{unet_alloc}{high_precision_loras}".encode()
-            ).hexdigest(),
-            "clip_settings": hashlib.sha256(
-                f"{clip_alloc}{high_precision_loras}".encode()
-            ).hexdigest(),
         }
 
         from nodes import CheckpointLoaderSimple

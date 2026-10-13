@@ -11,7 +11,6 @@ import math
 import torch
 import torch.utils._pytree as pytree
 import logging
-import re
 from collections import defaultdict, namedtuple
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
@@ -19,6 +18,7 @@ logger = logging.getLogger("MultiGPU")
 import comfy.model_management as mm
 import comfy.model_patcher
 import comfy.ops
+import comfy.sd1_clip
 from .device_utils import get_device_list
 from .model_management_mgpu import multigpu_memory_log
 
@@ -43,12 +43,18 @@ _HIP_SOFTWARE_GEMM_ARCHITECTURES = frozenset(
 _COMPUTE_GPU_RESERVE_BYTES = 512 * 1024 * 1024
 # Attention shrinks its chunks when it runs out of memory, so it needs less headroom.
 _ATTENTION_RESERVE_BYTES = 128 * 1024 * 1024
+# Share of each storage device's free memory left to other models and spilled activations.
+_STORAGE_RESERVE_FRACTION = 0.25
 # Chunks per mixed GEMM or attention call: with several, each chunk's copies to
 # and from the compute GPU overlap the neighbouring chunks' compute.
 _PIPELINE_CHUNKS = 8
 # Comfy Kitchen's int8 GEMM computes whole 128-row tiles, so a chunk of 520 rows
 # costs as much as 640. Chunks are cut to a multiple of this.
 _GEMM_ROW_TILE = 128
+# Below this many tokens a chunk's GEMM costs little more than its launch, so no
+# budget makes chunks smaller: a shortfall surfaces as an out-of-memory retry
+# instead of tens of thousands of one-token GEMMs.
+_MIN_CHUNK_TOKENS = 512
 # Conv tiles stop getting faster well below this, and larger ones let the
 # backend's im2col workspace exhaust the compute GPU. A fixed cap also keeps
 # tile shapes stable so MIOpen reuses its tuned kernels between runs.
@@ -108,7 +114,7 @@ _OVERWRITE_OPS = frozenset(
 
 # Ops that copy elementwise without the pointwise tag.
 _COPY_OPS = frozenset({"aten::_to_copy", "aten::copy_", "aten::clone"})
-# An op on at most this many bytes of donor tensors hops whole without checking free VRAM.
+# An op on at most this many bytes of spilled tensors hops whole, and a smaller result is never spilled.
 _STREAM_DIRECT_BYTES = 32 * 1024 * 1024
 # A tiled op moves slices of about this many bytes, enough to keep the copies busy.
 _STREAM_TILE_BYTES = 128 * 1024 * 1024
@@ -133,7 +139,7 @@ def _tile_axes(func, args, kwargs, leaves):
 
     if name in ("aten::_softmax", "aten::_log_softmax"):
         return [(shape[d], [d], d) for d in range(ndim) if d != args[1] % ndim and shape[d] > 1]
-    if name == "aten::native_layer_norm":
+    if name in ("aten::native_layer_norm", "aten::rms_norm", "aten::_fused_rms_norm"):
         return [(shape[d], [d] + rest, d) for d in range(ndim - len(args[1])) if shape[d] > 1]
     if name.startswith(("aten::upsample_", "aten::_upsample_")):
         return [(shape[d], [d], d) for d in range(2) if shape[d] > 1]
@@ -154,12 +160,16 @@ def _tile_axes(func, args, kwargs, leaves):
             for d in range(ndim)
             if shape[d] > 1 and (stack or d != dim)
         ]
-    if name == "comfy_kitchen::rms_rope_split_half_":
-        q, k, freqs_cis = leaves[:3]
+    if name.startswith("comfy_kitchen::rms_rope"):
+        # [B, S, H, D] q and k (x for the "1" ops), normed over D and rotated by a freqs_cis
+        # that broadcasts over the first three dims; the scales are per D.
+        count = 1 if name.removesuffix("_").endswith("1") else 2
+        freqs_cis = leaves[count]
         return [
-            (shape[d], [d, d, d if freqs_cis.shape[d] == shape[d] else None] + [None] * (len(leaves) - 3), d)
+            (shape[d], [d] * count + [d if freqs_cis.ndim > d and freqs_cis.shape[d] == shape[d] else None]
+             + [None] * (len(leaves) - count - 1), d)
             for d in range(3)
-            if shape[d] > 1 and k.shape[d] == shape[d]
+            if shape[d] > 1 and all(leaf.shape[d] == shape[d] for leaf in leaves[:count])
         ]
     if torch.Tag.reduction in func.tags:
         values = {
@@ -185,21 +195,49 @@ def _tile_axes(func, args, kwargs, leaves):
     return []
 
 
-class _StreamedActivations(TorchDispatchMode):
-    """Keep activations on the donor but run every op on the compute GPU.
+# Storage pointers of the pinned system-RAM buffers the running forward spilled activations to.
+_spilled = set()
 
-    An op with a donor tensor among its inputs copies them to the compute GPU,
-    runs there and copies its results back, so the donor only stores tensors
-    and does no math. Views, allocations and plain copies launch no kernel and
-    run in place. Code that is already on the compute GPU is unaffected.
+
+def _is_spilled(tensor):
+    return tensor.device.type == "cpu" and tensor.untyped_storage().data_ptr() in _spilled
+
+
+def _spill_buffer(shape, dtype):
+    """A pinned system-RAM buffer for an activation the compute GPU has no room for.
+
+    Pinned memory lets the compute GPU's copy engine move it asynchronously, so
+    neither the host nor another GPU (an APU would blit it with its shaders) does.
+    """
+    buffer = torch.empty(shape, dtype=dtype, pin_memory=True)
+    _spilled.add(buffer.untyped_storage().data_ptr())
+    return buffer
+
+
+def _activation_empty(shape, dtype, compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
+    """An activation buffer on the compute GPU when it fits, else spilled to pinned system RAM."""
+    nbytes = math.prod(shape) * dtype.itemsize
+    if nbytes <= _compute_budget(compute_device, reserve):
+        try:
+            return torch.empty(shape, dtype=dtype, device=compute_device)
+        except torch.OutOfMemoryError:
+            pass
+    return _spill_buffer(shape, dtype)
+
+
+class _StreamedActivations(TorchDispatchMode):
+    """Keep a model's activations on the compute GPU, spilling to pinned system RAM when it is full.
+
+    Ops on compute-GPU tensors run there as usual. One whose result would not fit
+    runs in slices whose results are copied to a pinned buffer as they complete
+    (see _tiled), so the GPU never waits on the host. An op that reads a spilled
+    tensor streams it back in slices and keeps its result on the compute GPU when
+    that fits. Ops on the model's own CPU tensors run on the CPU as usual.
     """
 
-    def __init__(self, donor_device, compute_device):
+    def __init__(self, compute_device):
         super().__init__()
-        self.donor = torch.device(donor_device)
         self.compute = torch.device(compute_device)
-        # A non-blocking copy to the CPU returns before its data has arrived.
-        self.async_to_donor = self.donor.type != "cpu"
         self.kinds = {}
 
     def _kind(self, func):
@@ -232,10 +270,12 @@ class _StreamedActivations(TorchDispatchMode):
             device = torch.device("cuda", torch.cuda.current_device())
         return device
 
-    def _tiled(self, func, kind, args, kwargs, budget):
+    def _tiled(self, func, kind, args, kwargs, budget, spill):
         """Run an op on the compute GPU one slice at a time so that only a few slices are ever there.
 
-        The slices go through _pipeline_on_compute, and the results are joined on the donor.
+        Spilled inputs are copied in slice by slice through _pipeline_on_compute.
+        A plain op's result goes to a pinned buffer when spill is set and to the
+        compute GPU otherwise; a mutating op writes its spilled tensors in place.
         """
         name = func._schema.name
         flat, spec = pytree.tree_flatten((args, kwargs))
@@ -260,17 +300,16 @@ class _StreamedActivations(TorchDispatchMode):
         fitting = [axis for axis in axes if rows_that_fit(axis) >= 1]
         extent, dims, out_dim = fitting[0] if fitting else max(axes)
         rows = max(1, min(rows_that_fit((extent, dims, out_dim)), extent))
-        whole = {
-            index: leaf.to(device=self.compute, non_blocking=True) if leaf.device == self.donor else leaf
-            for index, (leaf, dim) in enumerate(zip(leaves, dims))
-            if dim is None
-        }
+        # Every input moves, not just spilled ones: a weight cast to a spilled input's device
+        # (cast_bias_weight) is on the CPU without being spilled.
+        whole = {index: self._to_compute(leaf) for index, (leaf, dim) in enumerate(zip(leaves, dims)) if dim is None}
         written = sum(
             argument.alias_info is not None and argument.alias_info.is_write and "Tensor" in str(argument.type)
             for argument in func._schema.arguments
         )
         outputs = leaves[:written] if mutating else []
         progress = [0]
+        compute_stream = torch.cuda.current_stream(self.compute)
 
         def load(chunk):
             start, stop = chunk
@@ -280,7 +319,7 @@ class _StreamedActivations(TorchDispatchMode):
                     tiles.append(whole[index])
                     continue
                 tile = leaf.narrow(dim, start, stop - start)
-                if tile.device == self.donor:
+                if tile.device != self.compute:
                     if kind == "overwrite" and index == 0:
                         tile = torch.empty_like(tile, device=self.compute)
                     else:
@@ -303,7 +342,13 @@ class _StreamedActivations(TorchDispatchMode):
                 for tile in results:
                     shape = list(tile.shape)
                     shape[out_dim] = extent
-                    outputs.append(torch.empty(shape, dtype=tile.dtype, device=self.donor))
+                    # A result the compute GPU has no room for spills rather than raising: an
+                    # out-of-memory retry would find only the results allocated before it.
+                    output = _spill_buffer(shape, tile.dtype) if spill else _activation_empty(shape, tile.dtype, self.compute)
+                    if output.device == self.compute:
+                        # Allocated on the copy stream; the compute stream reads it next.
+                        output.record_stream(compute_stream)
+                    outputs.append(output)
             for index, (output, tile) in enumerate(zip(outputs, results)):
                 output.narrow(dims[index] if mutating else out_dim, start, stop - start).copy_(tile, non_blocking=True)
             progress[0] = stop
@@ -316,63 +361,86 @@ class _StreamedActivations(TorchDispatchMode):
                 if rows == 1:
                     raise
                 rows //= 2
-                if self.compute.type == "cuda":
-                    torch.cuda.synchronize(self.compute)
                 torch.cuda.empty_cache()
-        if self.compute.type == "cuda":
-            torch.cuda.synchronize(self.compute)
         if mutating:
             return args[0] if func._schema.returns else None
         return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
+    def _result_bytes(self, func, leaves):
+        """An upper estimate of an op's result size, from its inputs."""
+        if torch.Tag.pointwise in func.tags:
+            shape = torch.broadcast_shapes(*[leaf.shape for leaf in leaves])
+            return math.prod(shape) * max(leaf.element_size() for leaf in leaves)
+        if func._schema.name in ("aten::cat", "aten::stack"):
+            return sum(leaf.nbytes for leaf in leaves)
+        return max(leaf.nbytes for leaf in leaves)
+
+    def _on_compute(self, func, kind, args, kwargs, tensors):
+        """Run an op on compute-GPU tensors, spilling its result when the GPU has no room for it."""
+        large = kind == "plain" and tensors and max(tensor.nbytes for tensor in tensors) > _STREAM_DIRECT_BYTES
+        if large:
+            budget = _compute_budget(self.compute)
+            if self._result_bytes(func, tensors) > budget and _tile_axes(func, args, kwargs, tensors):
+                return self._tiled(func, kind, args, kwargs, budget, spill=True)
+        try:
+            return func(*args, **kwargs)
+        except torch.OutOfMemoryError:
+            if not large or not _tile_axes(func, args, kwargs, tensors):
+                raise
+        # cudaMallocAsync keeps freed blocks that a larger request cannot use until they are released.
+        torch.cuda.empty_cache()
+        return self._tiled(func, kind, args, kwargs, _compute_budget(self.compute), spill=True)
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         kind = self._kind(func)
+        tensors = [leaf for leaf in pytree.tree_leaves((args, kwargs)) if isinstance(leaf, torch.Tensor)]
+        spilled = [tensor for tensor in tensors if _is_spilled(tensor)]
         if kind == "metadata":
             # Under a dispatch mode aten::alias keeps the input's subclass, which breaks
             # torch.Tensor(subclass) for subclasses whose __init__ takes required kwargs (GGMLTensor).
             if func is torch.ops.aten.alias.default:
                 return func(*args, **kwargs).as_subclass(torch.Tensor)
+            if spilled and func is torch.ops.aten._local_scalar_dense.default:
+                # The host reads a spilled value, whose copy may still be in flight.
+                torch.cuda.current_stream(self.compute).synchronize()
             return func(*args, **kwargs)
         target = kwargs.get("device")
         target = None if target is None else self._resolve(target)
-        tensors = [leaf for leaf in pytree.tree_leaves((args, kwargs)) if isinstance(leaf, torch.Tensor)]
-        if target != self.donor and not any(tensor.device == self.donor for tensor in tensors):
-            return func(*args, **kwargs)
+        if not spilled:
+            if target not in (None, self.compute) or not all(tensor.device == self.compute for tensor in tensors):
+                return func(*args, **kwargs)
+            return self._on_compute(func, kind, args, kwargs, tensors)
 
         name = func._schema.name
-        donor_bytes = sum(tensor.nbytes for tensor in tensors if tensor.device == self.donor)
-        if (
-            donor_bytes > _STREAM_DIRECT_BYTES
-            and target in (None, self.donor)
-            and (name != "aten::copy_" or all(tensor.device == self.donor for tensor in args[:2]))
-            and (name != "aten::_to_copy" or args[0].device == self.donor)
-        ):
-            budget = mm.get_free_memory(self.compute) - _COMPUTE_GPU_RESERVE_BYTES
-            if 3 * donor_bytes > budget:
-                return self._tiled(func, kind, args, kwargs, budget)
+        if target is not None and target.type == "cpu":
+            torch.cuda.current_stream(self.compute).synchronize()
+            return func(*args, **kwargs)
+        spilled_bytes = sum(tensor.nbytes for tensor in spilled)
+        if spilled_bytes > _STREAM_DIRECT_BYTES and name not in ("aten::copy_", "aten::_to_copy"):
+            budget = _compute_budget(self.compute)
+            if 3 * spilled_bytes > budget:
+                # The result stays on the compute GPU when it fits beside the slices.
+                result_bytes = self._result_bytes(func, tensors) if kind == "plain" else 0
+                spill = result_bytes > budget // 2
+                return self._tiled(func, kind, args, kwargs, budget - (0 if spill else result_bytes), spill)
 
         if name == "aten::copy_":
             dst, src = args[0], args[1]
-            if dst.device == self.donor or src.device == self.donor:
-                if src.device == self.donor or src.dtype != dst.dtype:
-                    src = self._to_compute(src, dst.dtype)
-                return func(dst, src, *args[2:], **kwargs)
-        elif name == "aten::_to_copy":
+            if _is_spilled(src) or src.dtype != dst.dtype:
+                src = self._to_compute(src, dst.dtype)
+            return func(dst, src, *args[2:], **kwargs)
+        if name == "aten::_to_copy":
             src = args[0]
             dtype = kwargs.get("dtype")
             if (dtype is None or dtype == src.dtype) and target is not None and target != src.device:
                 return func(*args, **kwargs)
-            result = self._to_compute(src, dtype)
-            destination = src.device if target is None else target
-            if destination == self.compute:
-                return result
-            return result.to(device=destination, non_blocking=destination != self.donor or self.async_to_donor)
+            return self._to_compute(src, dtype)
 
         moved = {}
 
         def to_compute(tensor):
-            if tensor.device != self.donor:
+            if tensor.device == self.compute:
                 return tensor
             if id(tensor) not in moved:
                 if kind == "overwrite" and tensor is args[0]:
@@ -382,29 +450,19 @@ class _StreamedActivations(TorchDispatchMode):
             return moved[id(tensor)]
 
         compute_args, compute_kwargs = pytree.tree_map_only(torch.Tensor, to_compute, (args, kwargs))
-        if target == self.donor:
-            compute_kwargs["device"] = self.compute
         result = func(*compute_args, **compute_kwargs)
-
-        originals = {}
-        if kind != "plain":
-            for index, argument in enumerate(func._schema.arguments):
-                if argument.alias_info is None or not argument.alias_info.is_write:
-                    continue
-                value = args[index] if index < len(args) else kwargs.get(argument.name)
-                for tensor in pytree.tree_leaves(value):
-                    if isinstance(tensor, torch.Tensor) and tensor.device == self.donor:
-                        tensor.copy_(moved[id(tensor)], non_blocking=True)
-                        originals[id(moved[id(tensor)])] = tensor
-        if target is not None and target != self.donor:
+        if kind == "plain":
             return result
-
-        def to_donor(tensor):
-            if id(tensor) in originals:
-                return originals[id(tensor)]
-            return tensor.to(device=self.donor, non_blocking=self.async_to_donor) if tensor.device == self.compute else tensor
-
-        return pytree.tree_map_only(torch.Tensor, to_donor, result)
+        originals = {}
+        for index, argument in enumerate(func._schema.arguments):
+            if argument.alias_info is None or not argument.alias_info.is_write:
+                continue
+            value = args[index] if index < len(args) else kwargs.get(argument.name)
+            for tensor in pytree.tree_leaves(value):
+                if isinstance(tensor, torch.Tensor) and id(tensor) in moved:
+                    tensor.copy_(moved[id(tensor)], non_blocking=True)
+                    originals[id(moved[id(tensor)])] = tensor
+        return pytree.tree_map_only(torch.Tensor, lambda tensor: originals.get(id(tensor), tensor), result)
 
 
 def _is_hip_software_gemm_device(device):
@@ -428,7 +486,7 @@ def _is_comfy_kitchen_attention_enabled():
     return callable(enabled) and enabled()
 
 
-def _is_eligible_donor_gemm(module):
+def _is_eligible_streamed_gemm(module):
     weight = getattr(module, "weight", None)
     return isinstance(weight, torch.Tensor) and weight.ndim == 2
 
@@ -456,15 +514,13 @@ def _can_tile_conv_on_compute(module):
 
 
 def _compute_budget(compute_device, reserve=_COMPUTE_GPU_RESERVE_BYTES):
-    """Bytes of compute-GPU VRAM one GEMM or attention call may use for tiles."""
-    # Release cached blocks first: the cudaMallocAsync pool (--cuda-malloc) keeps
-    # freed tiles and cannot serve a larger request from them, so they are only
-    # free once returned to the driver. Blocks still read by pending copies to
-    # or from the donor are only released once every device has synchronized.
-    if torch.device(compute_device).type == "cuda":
-        for index in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(index)
-    torch.cuda.empty_cache()
+    """Bytes of compute-GPU VRAM one GEMM or attention call may use for tiles.
+
+    Measured without synchronizing, so the GPU keeps its queue. Memory the
+    allocator caches counts as free; the cudaMallocAsync pool (--cuda-malloc)
+    cannot serve a larger request from it, so callers that run out of memory
+    release it with torch.cuda.empty_cache() and retry smaller.
+    """
     return max(0, mm.get_free_memory(compute_device) - reserve)
 
 
@@ -487,11 +543,13 @@ def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
     """Run chunks on the compute GPU with their copies overlapping the compute.
 
     load(chunk) copies a chunk's inputs to the compute GPU, run(inputs) computes
-    its result there and store(chunk, result) copies the result back. Copies go
+    its result there and store(chunk, result) puts the result in place. Copies go
     on a side stream while the compute stream works on the neighbouring chunks.
     At most two chunks are in flight, so the compute GPU holds a few chunk
     buffers rather than the whole activation. during() runs once the first
-    chunk's compute is queued, so work it starts overlaps the rest.
+    chunk's compute is queued, so work it starts overlaps the rest. The streams
+    wait for each other on the GPU, never on the host: loads see what the compute
+    stream wrote before, and later work on it sees every stored chunk.
     """
     compute_device = torch.device(compute_device)
     if compute_device.type != "cuda":
@@ -505,6 +563,7 @@ def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
     if compute_device not in _PIPELINE_STREAMS:
         _PIPELINE_STREAMS[compute_device] = torch.cuda.Stream(compute_device)
     copy_stream = _PIPELINE_STREAMS[compute_device]
+    copy_stream.wait_stream(compute_stream)
 
     def load_on_copy_stream(chunk):
         with torch.cuda.stream(copy_stream):
@@ -531,40 +590,103 @@ def _pipeline_on_compute(chunks, compute_device, load, run, store, during=None):
         in_flight.append(copy_stream.record_event())
         if len(in_flight) > 2:
             in_flight.pop(0).synchronize()
+    compute_stream.wait_stream(copy_stream)
 
 
-def _token_chunks(tokens, token_bytes, budget):
-    """Token slices for _pipeline_on_compute: at least _PIPELINE_CHUNKS, three of which fit the budget.
+def _token_chunks(tokens, token_bytes, budget, streamed=True):
+    """Token slices for _pipeline_on_compute, three of which fit the budget.
 
     Three chunks sit on the compute GPU at once: one loading, one computing and
-    one being stored.
+    one being stored. Chunks are at least _MIN_CHUNK_TOKENS long, and chunks
+    that are copied (streamed) number at least _PIPELINE_CHUNKS, so that their
+    copies overlap the compute.
     """
-    per_chunk = max(1, min(-(-tokens // _PIPELINE_CHUNKS), budget // (3 * token_bytes)))
+    per_chunk = budget // (3 * token_bytes)
+    if streamed:
+        per_chunk = min(per_chunk, -(-tokens // _PIPELINE_CHUNKS))
+    per_chunk = max(_MIN_CHUNK_TOKENS, per_chunk)
     if per_chunk > _GEMM_ROW_TILE:
         per_chunk -= per_chunk % _GEMM_ROW_TILE
     return [slice(start, min(start + per_chunk, tokens)) for start in range(0, tokens, per_chunk)]
 
 
+def _gemm_weight_dtype(dtype, compute_device):
+    """The dtype a float GEMM weight is prepared in for activations of dtype.
+
+    float16 where dense_linear runs Comfy Kitchen's packed-fp16 GEMM, which would
+    otherwise cast the weight to float16 on every call; the staged weight then
+    also takes half the compute GPU's memory of float32. dtype elsewhere.
+    """
+    if (
+        getattr(comfy.ops, "_CK_PACKED", False)
+        and dtype in (torch.float32, torch.bfloat16)
+        and comfy.ops.quant_ops.ck.fp16_packed_linear_is_accelerated(torch.device(compute_device))
+    ):
+        return torch.float16
+    return dtype
+
+
 def _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up):
+    if weight.dtype != input_chunk.dtype and not comfy.ops._packed_linear_wanted(input_chunk, weight):
+        # A float16 weight (see _gemm_weight_dtype) on a GEMM too small for the packed kernel.
+        weight = weight.to(input_chunk.dtype)
     output_chunk = comfy.ops.dense_linear(input_chunk, weight, bias)
     if lora_down is not None:
         output_chunk.addmm_(input_chunk @ lora_down.t(), lora_up.t())
     return output_chunk
 
 
-def _run_linear_chunks(
-    flat_input, output, weight, bias, lora_down, lora_up, chunks, compute_device, during=None
-):
-    """Stream token chunks through a linear whose weight is already on the compute GPU."""
+def _run_token_chunks(flat_input, out_features, run, token_bytes, budget, compute_device, during=None):
+    """Run a token-wise run(input_chunk) over flat_input on the compute GPU; returns its result.
+
+    token_bytes bounds what one token needs there: its input, result and
+    temporaries. When the whole input does, it runs in one call. Otherwise the
+    result is an activation on the compute GPU, or spilled to pinned system RAM
+    when it does not fit (see _activation_empty), and is filled in token chunks;
+    only a spilled input is copied in, chunk by chunk. On running out of memory
+    the chunks are halved and the run repeated, which is safe because every
+    chunk writes only its own rows. during() runs once the first chunk is queued.
+    """
+    tokens = flat_input.shape[0]
+    compute_device = torch.device(compute_device)
     with _current_device(compute_device):
-        _pipeline_on_compute(
-            chunks,
-            compute_device,
-            lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
-            lambda input_chunk: _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up),
-            lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
-            during,
-        )
+        if flat_input.device == compute_device and tokens * token_bytes <= budget:
+            try:
+                output = run(flat_input)
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+            else:
+                if during is not None:
+                    during()
+                return output
+        # The output stays on the compute GPU only if the chunks still fit beside it.
+        output_bytes = tokens * out_features * flat_input.element_size()
+        if output_bytes + 3 * _MIN_CHUNK_TOKENS * token_bytes <= budget:
+            output = _activation_empty((tokens, out_features), flat_input.dtype, compute_device)
+        else:
+            output = _spill_buffer((tokens, out_features), flat_input.dtype)
+        if output.device == compute_device:
+            budget -= output.nbytes
+        streamed = flat_input.device != compute_device or output.device != compute_device
+        while True:
+            chunks = _token_chunks(tokens, token_bytes, budget, streamed)
+            try:
+                _pipeline_on_compute(
+                    chunks,
+                    compute_device,
+                    lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
+                    run,
+                    lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
+                    during,
+                )
+                return output
+            except torch.OutOfMemoryError:
+                # Chunks at the floor already ran after a cache release.
+                if chunks[0].stop <= _MIN_CHUNK_TOKENS and budget <= 0:
+                    raise
+            during = None
+            torch.cuda.empty_cache()
+            budget = budget // 2 if budget > 3 * _MIN_CHUNK_TOKENS * token_bytes else 0
 
 
 def _lora_on_compute(lora, compute_device, dtype):
@@ -581,18 +703,16 @@ def _lora_on_compute(lora, compute_device, dtype):
 def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lora=()):
     """Run a linear on the compute GPU in tiles sized to its free VRAM.
 
-    The input and output stay on the input's device; only token chunks, weight
-    tiles and their GEMM results visit the compute GPU. lora holds (down, up,
-    scale) patches that are added as low-rank GEMMs instead of being merged
-    into the weight.
+    Only token chunks, weight tiles and their GEMM results visit the compute
+    GPU when the input is spilled; the output is an activation (see
+    _activation_empty). lora holds (down, up, scale) patches that are added as
+    low-rank GEMMs instead of being merged into the weight.
     """
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
     tokens, in_features = flat_input.shape
     out_features = weight.shape[0]
-    output = torch.empty(
-        (tokens, out_features), device=input_tensor.device, dtype=input_tensor.dtype
-    )
-    lora_down, lora_up = _lora_on_compute(lora, compute_device, output.dtype)
+    dtype = input_tensor.dtype
+    lora_down, lora_up = _lora_on_compute(lora, compute_device, dtype)
     lora_rank = 0 if lora_down is None else lora_down.shape[0]
     row_bytes = in_features * weight.element_size()
     budget = _compute_budget(compute_device)
@@ -604,19 +724,19 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
     # budget; otherwise stream output-channel tiles for every token chunk.
     rows_per_tile = min(out_features, max(1, budget // 2 // row_bytes))
     if rows_per_tile == out_features:
-        token_bytes = (in_features + out_features + lora_rank) * output.element_size()
-        chunks = _token_chunks(tokens, token_bytes, budget - out_features * row_bytes)
-        _run_linear_chunks(
+        weight = weight.to(device=compute_device, non_blocking=True)
+        output = _run_token_chunks(
             flat_input,
-            output,
-            weight.to(device=compute_device, non_blocking=True),
-            bias,
-            lora_down,
-            lora_up,
-            chunks,
+            out_features,
+            lambda chunk: _linear_on_compute(chunk, weight, bias, lora_down, lora_up),
+            2 * (in_features + out_features + lora_rank) * dtype.itemsize,
+            budget - out_features * row_bytes,
             compute_device,
         )
         return output.reshape(*input_tensor.shape[:-1], out_features)
+
+    output = _activation_empty((tokens, out_features), dtype, compute_device)
+    budget = _compute_budget(compute_device)
 
     tokens_per_chunk = min(
         tokens,
@@ -669,8 +789,8 @@ def _run_tiled_linear_on_compute(input_tensor, weight, bias, compute_device, lor
 def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, compute_device):
     """Run a zero-padded conv2d or conv3d on the compute GPU in tiles.
 
-    The input and output stay on the input's device. Every spatial dim but the
-    width is tiled; each tile copies only the input it reads, including the
+    The output is an activation (see _activation_empty). Every spatial dim but
+    the width is tiled; each tile copies only the input it reads, including the
     kernel halo, and padding is applied on the compute GPU. Tiles run on
     Kitchen's fp16 implicit-GEMM conv where ComfyUI would use it.
     """
@@ -683,25 +803,19 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
         (length + 2 * pad - extent) // step + 1
         for length, pad, extent, step in zip(size, padding, span, stride)
     ]
-    output = torch.empty(
-        (batch, out_channels, *out_size),
-        device=input_tensor.device,
-        dtype=input_tensor.dtype,
-    )
+    output = _activation_empty((batch, out_channels, *out_size), input_tensor.dtype, compute_device)
     element_size = output.element_size()
     channel_bytes = weight[0].numel() * weight.element_size()
-    budget = _CONV_TILE_BUDGET_BYTES
-    # Only pay for synchronizing every device when VRAM is actually short.
-    if mm.get_free_memory(compute_device) - _COMPUTE_GPU_RESERVE_BYTES < budget:
-        budget = min(budget, _compute_budget(compute_device))
+    budget = min(_CONV_TILE_BUDGET_BYTES, _compute_budget(compute_device))
 
     channels_per_tile = min(out_channels, max(1, budget // 2 // channel_bytes))
     weight_buffer = torch.empty(
         (channels_per_tile, *weight.shape[1:]), device=compute_device, dtype=weight.dtype
     )
-    packed = comfy.ops._packed_conv_wanted(conv, input_tensor, weight_buffer)
+    direct = comfy.ops._direct_conv_wanted(conv, input_tensor, weight_buffer)
+    packed = not direct and comfy.ops._packed_conv_wanted(conv, input_tensor, weight_buffer)
     # MIOpen may lower the conv to a GEMM over an im2col workspace; Kitchen's conv has none.
-    workspace = 0 if packed else weight[0].numel()
+    workspace = 0 if packed or direct else weight[0].numel()
 
     def input_extent(chunk, dim):
         return (chunk[dim] - 1) * stride[dim] + span[dim]
@@ -771,8 +885,10 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
                         weight_tile.copy_(weight[start:end], non_blocking=True)
                     target[1] = slice(start, end)
                     bias_tile = None if bias is None else bias[start:end]
-                    if packed:
-                        result = comfy.ops.dense_conv(input_tile, weight_tile, bias_tile, stride, no_padding)
+                    if direct:
+                        result = comfy.ops.direct_conv(input_tile, weight_tile, bias_tile, stride, no_padding, dilation)
+                    elif packed:
+                        result = comfy.ops.dense_conv(input_tile, weight_tile, bias_tile, stride, no_padding, dilation)
                     else:
                         result = conv_op(input_tile, weight_tile, bias_tile, stride, 0, dilation)
                     output[tuple(target)].copy_(result, non_blocking=True)
@@ -781,20 +897,34 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
 
 
 def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_device, plan, **kwargs):
-    """Run attention on the compute GPU in head chunks over the whole sequence.
+    """Run attention on the compute GPU, in head chunks over the whole sequence when it must.
 
-    Heads are independent, so a chunk copies only its own heads' Q, K and V.
-    Every chunk takes all queries: backends prepare K and V on each call (Kitchen
-    int8 rotates and quantizes them), so query chunks would repeat that work.
-    There are at least _PIPELINE_CHUNKS head chunks, so their copies overlap
-    each other's attention, and three fit half the free VRAM. On OOM the call
-    restarts with half the heads, then half the queries, and plan keeps the
-    result for later calls. When one head group and one query still do not
-    fit, attention fails with an out-of-memory error.
+    Q, K and V on the compute GPU run in one call, retried once after releasing
+    the allocator's cached memory, until that runs out of memory; then, and for
+    spilled ones, heads are split. Heads are independent, so a chunk copies only
+    its own heads' Q, K and V. Every chunk takes all queries: backends prepare K
+    and V on each call (Kitchen int8 rotates and quantizes them), so query chunks
+    would repeat that work. Spilled heads come in at least _PIPELINE_CHUNKS
+    chunks, so their copies overlap each other's attention, and three chunks
+    fit half the free VRAM; heads already on the compute GPU run in as few
+    chunks as half the free VRAM allows. On OOM the call restarts with half the
+    heads, then half the queries, and plan keeps the result for later calls.
+    When one head group and one query still do not fit, attention fails with an
+    out-of-memory error.
     """
     key = (q.shape, k.shape)
+    compute_device = torch.device(compute_device)
     if mask is not None:
         return func(q, k, v, heads, mask, *args, **kwargs)
+    on_compute = q.device == k.device == v.device == compute_device
+    if key not in plan and on_compute:
+        for _ in range(2):
+            try:
+                return func(q, k, v, heads, None, *args, **kwargs)
+            except torch.OutOfMemoryError:
+                pass
+            # Recover outside the except block, once the failed call's tensors are freed.
+            torch.cuda.empty_cache()
 
     skip_reshape = kwargs.get("skip_reshape", False)
     skip_output_reshape = kwargs.get("skip_output_reshape", False)
@@ -817,14 +947,18 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
         group_bytes = (
             (k.numel() + v.numel()) // kv_heads + 3 * group * q.numel() // heads
         ) * q.element_size()
-        groups = max(
-            1,
-            min(-(-kv_heads // _PIPELINE_CHUNKS), budget // 2 // (3 * group_bytes)),
-        )
+        if on_compute:
+            # Chunks of Q, K and V already there are views: only the running chunk's
+            # backend temporaries, about group_bytes a head, take memory.
+            groups = budget // 2 // group_bytes
+        else:
+            groups = min(budget // 2 // (3 * group_bytes), -(-kv_heads // _PIPELINE_CHUNKS))
+        groups = max(1, min(groups, kv_heads))
         # [heads per chunk, queries per chunk]
         chunk = plan[key] = [groups * group, tokens]
 
     output = None
+    compute_stream = torch.cuda.current_stream(compute_device) if compute_device.type == "cuda" else None
 
     def load(part):
         head, count, start, length = part
@@ -847,7 +981,10 @@ def _run_attention_on_compute(func, q, k, v, heads, mask=None, *args, compute_de
             shape[out_seq_dim] = tokens
             head_axis = 1 if skip_output_reshape else -1
             shape[head_axis] = shape[head_axis] // count * heads
-            output = torch.empty(shape, device=q.device, dtype=result.dtype)
+            output = _activation_empty(shape, result.dtype, compute_device)
+            if output.device.type == "cuda":
+                # Allocated on the copy stream; the compute stream reads it next.
+                output.record_stream(compute_stream)
         head_slice(output, head, count, heads, not skip_output_reshape).narrow(out_seq_dim, start, length).copy_(result, non_blocking=True)
 
     while True:
@@ -909,7 +1046,7 @@ def _materialize_linear(module, dtype, device):
 
 def _log_weight_preparation(module, device, weight, used_comfy_cast):
     """Confirm once where a weight was materialized."""
-    if getattr(module, "_mgpu_donor_preparation_logged", False):
+    if getattr(module, "_mgpu_preparation_logged", False):
         return
 
     operations = ["dtype cast"]
@@ -931,7 +1068,7 @@ def _log_weight_preparation(module, device, weight, used_comfy_cast):
         weight.dtype,
         weight.numel() * weight.element_size() / (1024**2),
     )
-    module._mgpu_donor_preparation_logged = True
+    module._mgpu_preparation_logged = True
 
 
 def _plain_lora_patches(patches):
@@ -962,8 +1099,12 @@ def _plain_lora_patches(patches):
 
 
 @_without_streaming
-def _prepare_linear_on_donor(module, dtype, donor_device):
-    """Materialize a linear's weight on the donor; returns (weight, bias, offload_state, lora).
+def _prepare_linear(module, dtype, compute_device):
+    """Materialize a linear's weight on the compute GPU; returns (weight, bias, offload_state, lora).
+
+    The weight is copied there as stored (quantized) and dequantized and patched
+    there, wherever it is stored: the compute GPU is the fastest at that, and a
+    storage GPU such as an APU keeps its shaders free.
 
     Plain GGUF LoRAs are left out of the weight and returned as low-rank
     patches for the compute GPU; release with _release_prepared_linear.
@@ -981,12 +1122,12 @@ def _prepare_linear_on_donor(module, dtype, donor_device):
         patches = module.weight.patches
         module.weight.patches = []
     try:
-        with _current_device(donor_device):
-            weight, bias, offload_state = _materialize_linear(module, dtype, donor_device)
+        with _current_device(compute_device):
+            weight, bias, offload_state = _materialize_linear(module, dtype, compute_device)
     finally:
         if lora:
             module.weight.patches = patches
-    _log_weight_preparation(module, donor_device, weight, used_comfy_cast)
+    _log_weight_preparation(module, compute_device, weight, used_comfy_cast)
     return weight, bias, offload_state, lora
 
 
@@ -997,13 +1138,9 @@ def _release_prepared_linear(module, weight, bias, offload_state):
         uncast_bias_weight(module, weight, bias, offload_state)
 
 
-def _run_donor_prepared_linear_on_compute(
-    input_tensor, module, compute_device, donor_device
-):
-    """Prepare the weight on the donor and stream its tiles through the compute GPU."""
-    weight, bias, offload_state, lora = _prepare_linear_on_donor(
-        module, input_tensor.dtype, donor_device
-    )
+def _run_prepared_linear_on_compute(input_tensor, module, compute_device):
+    """Prepare a weight too large to stage and stream its tiles through the compute GPU."""
+    weight, bias, offload_state, lora = _prepare_linear(module, input_tensor.dtype, compute_device)
     try:
         return _run_tiled_linear_on_compute(
             input_tensor, weight, bias, compute_device, lora
@@ -1022,12 +1159,9 @@ class _MixedSchedule:
     otherwise hand it back to the copy stream too early.
     """
 
-    def __init__(self, compute_device, donor_device):
+    def __init__(self, compute_device):
         self.compute_device = compute_device
         self.copy_stream = torch.cuda.Stream(compute_device)
-        # Preparing a weight on the donor's default stream would queue it ahead of
-        # the chunk copies, which run there.
-        self.donor_stream = torch.cuda.Stream(donor_device)
         # Kept here, not on the modules: a module stored on another would be
         # registered as its submodule.
         self.following = {}
@@ -1035,15 +1169,14 @@ class _MixedSchedule:
         self.previous = None
         self.pending = []
         self.retired = []
-        self.free = None
 
-    def start_forward(self):
-        # Stages left from an interrupted forward would pin compute memory.
+    def end_forward(self):
+        """Drop every staged weight, so that none stays on the compute GPU between steps."""
         for module in self.pending:
             module._mgpu_staged = None
         self.pending = []
+        self.retired = []
         self.previous = None
-        self.free = None
 
     def linears(self, unit):
         return self.mlp_linears.get(unit, (unit,))
@@ -1055,16 +1188,6 @@ class _MixedSchedule:
         """Stage a unit's weights, or None when one is too large and streams in tiles instead."""
         staged = tuple(_stage_linear(linear, dtype, self) for linear in self.linears(unit))
         return None if any(linear is None for linear in staged) else staged
-
-    def budget(self, staged_bytes):
-        """Tile budget while staged_bytes of weights are on the compute GPU.
-
-        Measured once per forward: _compute_budget synchronizes every device, so
-        measuring at every unit would drain the pipeline between them.
-        """
-        if self.free is None:
-            self.free = _compute_budget(self.compute_device) + staged_bytes
-        return self.free - staged_bytes
 
     def retire(self, staged, compute_stream):
         for _, done in self.retired:
@@ -1078,7 +1201,7 @@ _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype
 def _staged_weight_bytes(module, dtype):
     if module._mgpu_quantized:
         return mm.module_size(module)
-    return module.out_features * module.in_features * dtype.itemsize
+    return module.out_features * module.in_features * _gemm_weight_dtype(dtype, module._mgpu_compute_device).itemsize
 
 
 def _copy_to_compute(weight, compute_device):
@@ -1107,8 +1230,10 @@ def _copy_to_compute(weight, compute_device):
 def _stage_linear(module, dtype, schedule=None):
     """Put a mixed linear's GEMM weight on the compute GPU, on the schedule's streams if given.
 
-    A quantized linear sends its stored weight; others are prepared on the donor. Returns None for a prepared weight larger than half
-    the compute GPU's free memory, which streams in tiles instead.
+    A quantized linear sends its stored weight; others are prepared there (see
+    _prepare_linear). Returns None for a prepared weight larger than half the
+    compute GPU's free memory, or one that still runs out of memory after the
+    allocator's cache is released; it streams in tiles instead.
     """
     compute_device = module._mgpu_compute_device
     if not module._mgpu_quantized and compute_device.type == "cuda" and (
@@ -1116,47 +1241,56 @@ def _stage_linear(module, dtype, schedule=None):
         > mm.get_free_memory(compute_device) - _COMPUTE_GPU_RESERVE_BYTES
     ):
         return None
-    streams = contextlib.ExitStack()
-    if schedule is not None:
-        streams.enter_context(torch.cuda.stream(schedule.donor_stream))
-        streams.enter_context(torch.cuda.stream(schedule.copy_stream))
-    with streams:
-        if module._mgpu_quantized:
-            weight, bias, lora = module.weight, module.bias, ()
-            offload_state = None
-        else:
-            weight, bias, offload_state, lora = _prepare_linear_on_donor(
-                module, dtype, module._mgpu_donor_execution_device
-            )
+    for attempt in range(2):
+        streams = contextlib.ExitStack()
+        if schedule is not None:
+            streams.enter_context(torch.cuda.stream(schedule.copy_stream))
         try:
-            staged_weight = _copy_to_compute(weight, compute_device)
-            staged_bias = None if bias is None else bias.to(device=compute_device, non_blocking=True)
-            lora_down, lora_up = _lora_on_compute(lora, compute_device, dtype)
-        finally:
-            _release_prepared_linear(module, weight, bias, offload_state)
+            with streams:
+                if module._mgpu_quantized:
+                    weight, bias, lora = module.weight, module.bias, ()
+                    offload_state = None
+                else:
+                    weight, bias, offload_state, lora = _prepare_linear(
+                        module, _gemm_weight_dtype(dtype, compute_device), compute_device
+                    )
+                try:
+                    staged_weight = _copy_to_compute(weight, compute_device)
+                    # A float linear's bias stays in the activation dtype, whatever its weight is prepared in.
+                    bias_dtype = None if module._mgpu_quantized else dtype
+                    staged_bias = None if bias is None else bias.to(device=compute_device, dtype=bias_dtype, non_blocking=True)
+                    lora_down, lora_up = _lora_on_compute(lora, compute_device, dtype)
+                finally:
+                    _release_prepared_linear(module, weight, bias, offload_state)
+            break
+        except torch.OutOfMemoryError:
+            if attempt and module._mgpu_quantized:
+                raise
+        # cudaMallocAsync (--cuda-malloc) keeps freed blocks that a request of another
+        # size cannot use until they are released.
+        torch.cuda.empty_cache()
+    else:
+        return None
     ready = schedule.copy_stream.record_event() if schedule is not None else None
     return _StagedLinear(staged_weight, staged_bias, lora_down, lora_up, dtype, ready)
 
 
 def _run_staged_linear(input_tensor, staged, compute_device, budget, during=None):
-    """Stream token chunks through a staged weight, with copies overlapping the GEMMs."""
+    """Run token chunks through a staged weight, with any copies overlapping the GEMMs."""
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
-    tokens, in_features = flat_input.shape
+    in_features = flat_input.shape[1]
     out_features = staged.weight.shape[0]
-    output = torch.empty(
-        (tokens, out_features), device=input_tensor.device, dtype=input_tensor.dtype
-    )
     lora_rank = 0 if staged.lora_down is None else staged.lora_down.shape[0]
     # Input, output and LoRA chunks, doubled for the kernel's temporaries.
-    token_bytes = 2 * (in_features + out_features + lora_rank) * output.element_size()
-    _run_linear_chunks(
+    token_bytes = 2 * (in_features + out_features + lora_rank) * input_tensor.element_size()
+    output = _run_token_chunks(
         flat_input,
-        output,
-        staged.weight,
-        staged.bias,
-        staged.lora_down,
-        staged.lora_up,
-        _token_chunks(tokens, token_bytes, budget),
+        out_features,
+        lambda chunk: _linear_on_compute(
+            chunk, staged.weight, staged.bias, staged.lora_down, staged.lora_up
+        ),
+        token_bytes,
+        budget,
         compute_device,
         during,
     )
@@ -1183,7 +1317,8 @@ def _start_unit(unit, staged, dtype, schedule):
     if schedule.previous is not None:
         schedule.following[schedule.previous] = unit
     schedule.previous = unit
-    budget = schedule.budget(schedule.weight_bytes(unit, dtype))
+    # The unit's own weights are already on the compute GPU.
+    budget = _compute_budget(schedule.compute_device)
     compute_stream = torch.cuda.current_stream(schedule.compute_device)
     for linear in staged:
         compute_stream.wait_event(linear.ready)
@@ -1211,9 +1346,7 @@ def _run_mixed_linear(input_tensor, module):
     else:
         staged = _take_staged(module, input_tensor.dtype, schedule)
     if staged is None:
-        return _run_donor_prepared_linear_on_compute(
-            input_tensor, module, compute_device, module._mgpu_donor_execution_device
-        )
+        return _run_prepared_linear_on_compute(input_tensor, module, compute_device)
     budget, during = _start_unit(module, staged, input_tensor.dtype, schedule)
     output = _run_staged_linear(input_tensor, staged[0], compute_device, budget, during)
     schedule.retire(staged, torch.cuda.current_stream(compute_device))
@@ -1235,9 +1368,9 @@ def _staged_parameters(module, staged):
 def _run_fused_mlp(input_tensor, mlp):
     """Run a token-wise MLP whole on the compute GPU, one token chunk at a time.
 
-    Each chunk is copied there and its result back once, so the wide hidden
-    activation never visits the donor and the activation function runs on the
-    compute GPU. Its linears run the weights staged here (see configure_mixed_gemm).
+    A spilled input is copied there and its result back once per chunk, and the
+    wide hidden activation never leaves the compute GPU. Its linears run the
+    weights staged here (see configure_mixed_gemm).
     """
     schedule = mlp._mgpu_schedule
     compute_device = schedule.compute_device
@@ -1247,14 +1380,10 @@ def _run_fused_mlp(input_tensor, mlp):
     linears = schedule.linears(mlp)
     budget, during = _start_unit(mlp, staged, input_tensor.dtype, schedule)
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
-    tokens = flat_input.shape[0]
-    output = torch.empty(
-        (tokens, linears[-1].out_features), device=input_tensor.device, dtype=input_tensor.dtype
-    )
     # The input and every linear's output, doubled for activations and kernel temporaries.
     token_bytes = (
         2 * (flat_input.shape[-1] + sum(linear.out_features for linear in linears))
-        * output.element_size()
+        * input_tensor.element_size()
     )
     with contextlib.ExitStack() as stack:
         for linear, weights in zip(linears, staged):
@@ -1262,15 +1391,15 @@ def _run_fused_mlp(input_tensor, mlp):
             stack.callback(setattr, linear, "_mgpu_fused", None)
             if linear._mgpu_quantized:
                 stack.enter_context(_staged_parameters(linear, weights))
-        with _current_device(compute_device):
-            _pipeline_on_compute(
-                _token_chunks(tokens, token_bytes, budget),
-                compute_device,
-                lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
-                mlp._mgpu_original_forward,
-                lambda chunk, result: output[chunk].copy_(result, non_blocking=True),
-                during,
-            )
+        output = _run_token_chunks(
+            flat_input,
+            linears[-1].out_features,
+            mlp._mgpu_original_forward,
+            token_bytes,
+            budget,
+            compute_device,
+            during,
+        )
     schedule.retire(staged, torch.cuda.current_stream(compute_device))
     return output.reshape(*input_tensor.shape[:-1], output.shape[-1])
 
@@ -1293,26 +1422,16 @@ def _run_quantized_linear_on_compute(input_tensor, module, compute_device):
         staged = _take_staged(module, dtype, schedule)
         budget, during = _start_unit(module, staged, dtype, schedule)
     flat_input = input_tensor.reshape(-1, input_tensor.shape[-1])
-    tokens = flat_input.shape[0]
     # A quantized copy of each input chunk and its output.
     token_bytes = 2 * (module.in_features + module.out_features) * input_tensor.element_size()
-    output = None
-
-    def store(chunk, result):
-        nonlocal output
-        if output is None:
-            output = torch.empty(
-                (tokens, result.shape[-1]), device=input_tensor.device, dtype=result.dtype
-            )
-        output[chunk].copy_(result, non_blocking=True)
-
-    with _staged_parameters(module, staged[0]), _current_device(compute_device):
-        _pipeline_on_compute(
-            _token_chunks(tokens, token_bytes, budget),
-            compute_device,
-            lambda chunk: flat_input[chunk].to(device=compute_device, non_blocking=True),
+    with _staged_parameters(module, staged[0]):
+        output = _run_token_chunks(
+            flat_input,
+            module.out_features,
             module._mgpu_original_forward,
-            store,
+            token_bytes,
+            budget,
+            compute_device,
             during,
         )
     if schedule is not None:
@@ -1324,10 +1443,10 @@ def _configure_mixed_conv(module):
     """Tile a conv's math onto the compute GPU below its own forward.
 
     Hooking _conv_forward keeps layer-specific padding and temporal caches
-    (such as Wan's CausalConv3d) and ComfyUI's weight casts on the donor.
+    (such as Wan's CausalConv3d) and ComfyUI's weight casts.
     """
     module._mgpu_original_conv_forward = module._conv_forward
-    module._mgpu_donor_gemm_calls = 0
+    module._mgpu_gemm_calls = 0
 
     def mixed_conv_forward(input, weight, bias, autopad=None):
         padding = module.padding
@@ -1339,14 +1458,19 @@ def _configure_mixed_conv(module):
         # Matches comfy.ops.Conv3d: the causal kernel is cut to the frames present.
         if autopad == "causal_zero":
             weight = weight[:, :, -input.shape[2] :]
-        output = _run_tiled_conv_on_compute(
-            module, input, weight, bias, padding, module._mgpu_compute_device
-        )
-        module._mgpu_donor_gemm_calls += 1
-        if module._mgpu_donor_gemm_calls == 1:
+        if comfy.ops._linear_conv_wanted(module, input, weight):
+            # A kernel spanning its whole input (a patch embed) is a linear over the flat patches.
+            output = _run_tiled_linear_on_compute(
+                input.flatten(1), weight.flatten(1), bias, module._mgpu_compute_device
+            ).reshape(input.shape[0], -1, *(1,) * (input.dim() - 2))
+        else:
+            output = _run_tiled_conv_on_compute(
+                module, input, weight, bias, padding, module._mgpu_compute_device
+            )
+        module._mgpu_gemm_calls += 1
+        if module._mgpu_gemm_calls == 1:
             logger.info(
-                "[MultiGPU DisTorch V2] Donor-prepared compute conv active: %s -> %s (%s)",
-                input.device,
+                "[MultiGPU DisTorch V2] Streamed conv active on %s (%s)",
                 module._mgpu_compute_device,
                 type(module).__name__,
             )
@@ -1359,24 +1483,24 @@ def _configure_mixed_conv(module):
 _LINEAR_FUSION_KWARGS = frozenset(("input_act", "act_weight", "residual", "residual_scale"))
 
 
-def configure_mixed_gemm(module, compute_device, donor_device, schedule=None):
-    """Run an eligible linear's or conv's GEMM on the compute GPU; its activations stay on the donor.
+def configure_mixed_gemm(module, compute_device, schedule=None):
+    """Run an eligible linear's or conv's GEMM on the compute GPU from weights stored elsewhere.
 
     With a schedule, each linear stages the next one's weight while it runs (see _run_mixed_linear).
     """
     if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
         tileable = _can_tile_conv_on_compute(module)
-    elif _is_eligible_donor_gemm(module):
+    elif _is_eligible_streamed_gemm(module):
         tileable = _can_tile_linear_on_compute(module)
     else:
         return False
     if not tileable:
-        if not getattr(module, "_mgpu_donor_skip_logged", False):
+        if not getattr(module, "_mgpu_skip_logged", False):
             logger.info(
                 "[MultiGPU DisTorch V2] Mixed compute GEMM skipped for %s: module is not a standard linear or ungrouped conv",
                 type(module).__name__,
             )
-            module._mgpu_donor_skip_logged = True
+            module._mgpu_skip_logged = True
         return False
 
     module._mgpu_compute_device = torch.device(compute_device)
@@ -1385,7 +1509,6 @@ def configure_mixed_gemm(module, compute_device, donor_device, schedule=None):
             _configure_mixed_conv(module)
         return True
 
-    module._mgpu_donor_execution_device = torch.device(donor_device)
     # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
     module._mgpu_quantized = getattr(module, "layout_type", None) is not None
     module._mgpu_schedule = schedule
@@ -1394,14 +1517,14 @@ def configure_mixed_gemm(module, compute_device, donor_device, schedule=None):
     module._mgpu_fused = None
     if not hasattr(module, "_mgpu_original_forward"):
         module._mgpu_original_forward = module.forward
-        module._mgpu_donor_gemm_calls = 0
+        module._mgpu_gemm_calls = 0
 
         def mixed_forward(*args, **kwargs):
             if len(args) != 1 or not isinstance(args[0], torch.Tensor) or kwargs.keys() - _LINEAR_FUSION_KWARGS:
                 return module._mgpu_original_forward(*args, **kwargs)
             if kwargs:
-                # ComfyUI's fused prologue/epilogue kernels would run on the donor
-                # tensors; unfold them so the GEMM itself still goes to the compute GPU.
+                # ComfyUI's fused prologue/epilogue kernels expect the weight beside the
+                # input; unfold them so the GEMM itself runs from the staged weight.
                 x = comfy.ops._eager_input_act(args[0], kwargs.get("input_act"), kwargs.get("act_weight"))
                 return comfy.ops._linear_residual(mixed_forward(x), kwargs.get("residual"), kwargs.get("residual_scale"))
             fused = module._mgpu_fused
@@ -1417,11 +1540,10 @@ def configure_mixed_gemm(module, compute_device, donor_device, schedule=None):
                 )
             else:
                 output = _run_mixed_linear(args[0], module)
-            module._mgpu_donor_gemm_calls += 1
-            if module._mgpu_donor_gemm_calls == 1:
+            module._mgpu_gemm_calls += 1
+            if module._mgpu_gemm_calls == 1:
                 logger.info(
-                    "[MultiGPU DisTorch V2] Donor-prepared compute GEMM active: %s -> %s (%s)",
-                    module._mgpu_donor_execution_device,
+                    "[MultiGPU DisTorch V2] Streamed GEMM active on %s (%s)",
                     module._mgpu_compute_device,
                     type(module).__name__,
                 )
@@ -1446,14 +1568,17 @@ _MLP_ACTIVATIONS = (
 def _fused_mlp_linears(module, schedule):
     """The linears of a token-wise MLP whose GEMMs all run staged on the compute GPU, or None.
 
-    Token-wise MLPs are a Sequential of linears and activations, or a SwiGLU
-    FeedForward's w1, w3 and w2 (as in Lumina and Z-Image).
+    Token-wise MLPs are a Sequential of linears and activations, a SwiGLU
+    FeedForward's w1, w3 and w2 (as in Lumina and Z-Image), or an fc1 and fc2
+    pair (as in MiniMax H3).
     """
     children = dict(module.named_children())
     if isinstance(module, torch.nn.Sequential):
         linears = [child for child in children.values() if not isinstance(child, _MLP_ACTIVATIONS)]
     elif children.keys() == {"w1", "w2", "w3"}:
         linears = [children["w1"], children["w3"], children["w2"]]
+    elif children.keys() == {"fc1", "fc2"}:
+        linears = [children["fc1"], children["fc2"]]
     else:
         return None
     if len(linears) < 2 or any(
@@ -1494,29 +1619,14 @@ def _first_tensor(value):
     return None
 
 
-def _mixed_weight_device(module, donor_device):
-    """Where a module's weights are stored while the donor holds activations.
+def _streams_activations(model, model_size, compute_device, is_clip=False):
+    """Whether a model runs streamed: weights stored off the compute GPU, activations on it.
 
-    Castable weights stay where they were loaded (a memory-mapped GGUF stays
-    on disk) and are prepared on the donor one layer at a time, so the donor's
-    memory is left to activations and the compute GPU only holds GEMM tiles.
-    Modules that cannot be cast at runtime live on the donor.
+    Only diffusion models and text encoders that would crowd the compute GPU
+    stream: one taking at most half its free memory loads whole as usual.
     """
-    return "cpu" if hasattr(module, "comfy_cast_weights") else donor_device
-
-
-def select_mixed_donor_device(model, block_assignments, compute_device):
-    """Pick the donor that holds a diffusion model's activations, or None.
-
-    A donor GPU is preferred over the CPU when the allocation uses both.
-    """
-    compute_device = torch.device(compute_device)
-    donors = sorted(
-        {str(device) for device in block_assignments.values()} - {str(compute_device)},
-        key=lambda device: device == "cpu",
-    )
-    if not donors or not hasattr(model, "diffusion_model"):
-        return None
+    if not (is_clip or hasattr(model, "diffusion_model")) or 2 * model_size <= mm.get_free_memory(compute_device):
+        return False
     reasons = []
     if not _is_comfy_kitchen_attention_enabled():
         reasons.append("Comfy Kitchen attention is disabled")
@@ -1524,26 +1634,44 @@ def select_mixed_donor_device(model, block_assignments, compute_device):
         reasons.append(f"compute device {compute_device} lacks HIP software GEMM")
     if reasons:
         logger.info(
-            "[MultiGPU DisTorch V2] Donor activations disabled: %s", "; ".join(reasons)
+            "[MultiGPU DisTorch V2] Streamed execution disabled: %s", "; ".join(reasons)
         )
-        return None
-    return torch.device(donors[0])
+        return False
+    return True
 
 
-def configure_mixed_execution(diffusion_model, donor_device, compute_device, schedule):
-    """Keep the diffusion model's activations on the donor and run all compute on the compute GPU.
+def _evict_step(schedule, compute_device):
+    """Leave nothing of a finished (or failed) forward on the compute GPU.
 
-    Every op that touches a donor tensor is streamed to the compute GPU (see
-    _StreamedActivations); linears and convs (see configure_mixed_gemm), token-wise
-    MLPs (see _run_fused_mlp) and attention run there in tiles sized to its free VRAM.
+    Its activations are already unreferenced; this drops the staged weights and
+    returns the allocator's cached blocks, which the cudaMallocAsync pool
+    (--cuda-malloc) would otherwise keep out of a later, larger request. The next
+    step, and whatever runs between steps (such as a preview decode), starts
+    with the compute GPU's memory free. It synchronizes once per step.
+    """
+    if compute_device.type == "cuda":
+        # The staged weights came from the copy stream; the compute stream must be done with them.
+        torch.cuda.synchronize(compute_device)
+    schedule.end_forward()
+    _spilled.clear()
+    if compute_device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def configure_mixed_execution(diffusion_model, compute_device, schedule):
+    """Run the diffusion model with its activations on the compute GPU and its weights streamed in.
+
+    Activations spill to pinned system RAM only when the compute GPU has no room
+    for them (see _StreamedActivations); linears and convs (see
+    configure_mixed_gemm), token-wise MLPs (see _run_fused_mlp) and attention run
+    in tiles sized to its free VRAM. Every step ends by evicting what it left on
+    the compute GPU (see _evict_step).
     """
     if not hasattr(diffusion_model, "_mgpu_original_forward"):
         diffusion_model._mgpu_original_forward = diffusion_model.forward
 
         def mixed_forward(*args, transformer_options={}, **kwargs):
-            donor = diffusion_model._mgpu_donor_execution_device
             compute = diffusion_model._mgpu_compute_device
-            diffusion_model._mgpu_schedule.start_forward()
             output_device = _first_tensor(args).device
             transformer_options = transformer_options.copy()
             previous_override = transformer_options.get("optimized_attention_override")
@@ -1560,37 +1688,74 @@ def configure_mixed_execution(diffusion_model, donor_device, compute_device, sch
                 )
 
             transformer_options["optimized_attention_override"] = attention_on_compute
-            donor_args = _move_tensors(args, donor)
-            with _StreamedActivations(donor, compute), _current_device(compute):
-                output = diffusion_model._mgpu_original_forward(
-                    *donor_args,
-                    transformer_options=transformer_options,
-                    **_move_tensors(kwargs, donor),
-                )
-            return _move_tensors(output, output_device)
+            try:
+                with _StreamedActivations(compute), _current_device(compute):
+                    output = diffusion_model._mgpu_original_forward(
+                        *_move_tensors(args, compute),
+                        transformer_options=transformer_options,
+                        **_move_tensors(kwargs, compute),
+                    )
+                return _move_tensors(output, output_device)
+            finally:
+                _evict_step(diffusion_model._mgpu_schedule, compute)
 
         diffusion_model.forward = mixed_forward
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed execution: activations on %s, all compute on %s",
-            donor_device,
+            "[MultiGPU DisTorch V2] Streamed execution: activations on %s, evicted when each step completes",
             compute_device,
         )
 
-    diffusion_model._mgpu_donor_execution_device = torch.device(donor_device)
     diffusion_model._mgpu_compute_device = torch.device(compute_device)
     diffusion_model._mgpu_schedule = schedule
     # Chunk sizes learned from OOMs, a few ints per attention shape, kept until the next load.
     diffusion_model._mgpu_attention_plan = {}
-    for module in diffusion_model.modules():
+    _configure_fused_mlps(diffusion_model, compute_device, schedule)
+
+
+def _configure_fused_mlps(model, compute_device, schedule):
+    for module in model.modules():
         linears = _fused_mlp_linears(module, schedule)
         if linears is not None:
             configure_fused_mlp(module, linears, schedule)
     if schedule.mlp_linears:
         logger.info(
-            "[MultiGPU DisTorch V2] Mixed execution: %d MLPs run whole on %s in token chunks",
+            "[MultiGPU DisTorch V2] Streamed execution: %d MLPs run whole on %s in token chunks",
             len(schedule.mlp_linears),
             compute_device,
         )
+
+
+def configure_streamed_text_encoder(model, compute_device, schedule):
+    """Run a text encoder's encodes with activations on the compute GPU and weights streamed in.
+
+    Each SDClipModel forward (its vision tower included) runs as a diffusion
+    model's does (see configure_mixed_execution) and ends by evicting what it
+    left on the compute GPU. Its attention takes no override, so an op the
+    compute GPU has no room for is tiled by _StreamedActivations.
+    """
+    for encoder in model.modules():
+        if not isinstance(encoder, comfy.sd1_clip.SDClipModel):
+            continue
+        if not hasattr(encoder, "_mgpu_original_forward"):
+            encoder._mgpu_original_forward = encoder.forward
+
+            def streamed_forward(*args, encoder=encoder, **kwargs):
+                compute = encoder._mgpu_compute_device
+                try:
+                    with _StreamedActivations(compute), _current_device(compute):
+                        return encoder._mgpu_original_forward(*args, **kwargs)
+                finally:
+                    _evict_step(encoder._mgpu_schedule, compute)
+
+            encoder.forward = streamed_forward
+            logger.info(
+                "[MultiGPU DisTorch V2] Streamed execution: %s activations on %s, evicted when each encode completes",
+                type(encoder).__name__,
+                compute_device,
+            )
+        encoder._mgpu_compute_device = torch.device(compute_device)
+        encoder._mgpu_schedule = schedule
+    _configure_fused_mlps(model, compute_device, schedule)
 
 
 def register_patched_safetensor_modelpatcher():
@@ -1716,35 +1881,20 @@ def register_patched_safetensor_modelpatcher():
                 inner_model = loaded_model.model.model
 
                 if hasattr(inner_model, "_distorch_v2_meta"):
-                    meta = inner_model._distorch_v2_meta
-                    allocation_str = meta["full_allocation"]
-
-                    # Parse allocation string: "expert#compute_device;virtual_vram_gb;donors"
-                    parts = allocation_str.split("#")
-                    virtual_vram_gb = 0.0
-                    has_eject = False
-
-                    if len(parts) > 1:
-                        virtual_vram_str = parts[1]
-                        virtual_info = virtual_vram_str.split(";")
-                        if len(virtual_info) > 1:
-                            virtual_vram_gb = float(virtual_info[1])
-                        if len(virtual_info) > 2 and virtual_info[2]:
-                            has_eject = True
-
-                    if has_eject:
+                    if inner_model._distorch_v2_meta["eject_models"]:
                         eject_device = device
                         logger.mgpu_mm_log(
                             "DisTorch eject_models detected - MAX memory eviction"
                         )
-
-                    virtual_vram_bytes = virtual_vram_gb * (1024**3)
-                    adjusted_memory = max(0, base_memory - virtual_vram_bytes)
+                    # Weights the compute GPU cannot hold are placed on other devices
+                    # when the model loads (see place_weights), so the request is capped
+                    # at what the device has.
+                    adjusted_memory = min(base_memory, mm.get_total_memory(device))
                     total_memory_required[device] = (
                         total_memory_required.get(device, 0) + adjusted_memory
                     )
                     logger.mgpu_mm_log(
-                        f"DisTorch model adjusted {(base_memory - virtual_vram_bytes)/(1024**3):.2f}GB for device {device}"
+                        f"DisTorch model requests {adjusted_memory/(1024**3):.2f}GB for device {device}"
                     )
                 else:
                     # Standard model: use full model size
@@ -1857,14 +2007,9 @@ def register_patched_safetensor_modelpatcher():
                 logger.debug(
                     f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no metadata, using standard loading"
                 )
-                result = original_partially_load(
+                return original_partially_load(
                     self, device_to, extra_memory, force_patch_weights
                 )
-                if hasattr(self, "_distorch_block_assignments"):
-                    del self._distorch_block_assignments
-                return result
-
-            allocations = inner_model._distorch_v2_meta["full_allocation"]
 
             if not hasattr(self.model, "_distorch_high_precision_loras"):
                 self.model._distorch_high_precision_loras = True
@@ -1886,89 +2031,52 @@ def register_patched_safetensor_modelpatcher():
             self.patch_model(load_weights=False)
 
             mem_counter = 0
-
+            device_to = torch.device(device_to)
             is_clip_model = getattr(self, "is_clip", False)
-            ## TODO - I do not believe this code is needed and needs to be flagged for proof it is needed
-            # Check for valid cache
-            allocations_match = (
-                hasattr(self, "_distorch_last_allocations")
-                and self._distorch_last_allocations == allocations
-            )
-            compute_device_matches = hasattr(
-                self, "_distorch_last_compute_device"
-            ) and self._distorch_last_compute_device == str(torch.device(device_to))
-            cache_exists = hasattr(self, "_distorch_cached_assignments")
-
-            if (
-                cache_exists
-                and allocations_match
-                and compute_device_matches
-                and not unpatch_weights
-                and not force_patch_weights
-            ):
-                device_assignments = self._distorch_cached_assignments
-                logger.debug(
-                    f"[MultiGPU DisTorch V2] Reusing cached analysis for {type(inner_model).__name__}"
-                )
-            else:
-                device_assignments = analyze_safetensor_loading(
-                    self,
-                    allocations,
-                    is_clip=is_clip_model,
-                    compute_device=device_to,
-                )  ## This should be the only required line - that is how it worked previous release so if it doesn't it is Comfy changes
-                self._distorch_cached_assignments = device_assignments
-                self._distorch_last_allocations = allocations
-                self._distorch_last_compute_device = str(torch.device(device_to))
-
-            model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
-            high_precision_loras = getattr(
-                self.model, "_distorch_high_precision_loras", True
-            )
             # DisTorch2 VAE loaders patch the VAE's first_stage_model directly. A VAE's
-            # decode tiles already bound its activations, so it runs on the compute GPU
-            # with its weights where the allocation put them instead of on the donor.
+            # decode tiles already bound its activations, so it is never streamed.
             is_vae = (
                 not is_clip_model
                 and not hasattr(self.model, "diffusion_model")
                 and hasattr(self.model, "decode")
             )
-            mixed_donor_device = None
-            schedule = None
-            if not is_vae:
-                mixed_donor_device = select_mixed_donor_device(
-                    self.model,
-                    device_assignments["block_assignments"],
-                    device_to,
+            model_size = sum(unpack_load_item(item)[0] for item in self._load_list())
+            streamed = not is_vae and _streams_activations(
+                self.model, model_size, device_to, is_clip_model
+            )
+            placement_key = (str(device_to), streamed)
+            if (
+                getattr(self, "_distorch_placement_key", None) == placement_key
+                and not unpatch_weights
+                and not force_patch_weights
+            ):
+                block_assignments = self._distorch_cached_assignments
+            else:
+                block_assignments = place_weights(
+                    self, device_to, streamed, is_clip=is_clip_model
                 )
-            if mixed_donor_device is not None:
-                logger.info(
-                    "[MultiGPU DisTorch V2] %s holds activations; weights stay in system RAM or memory-mapped on disk",
-                    mixed_donor_device,
-                )
-                # A CPU donor would dequantize and patch weights far slower than the compute GPU.
-                prepare_device = (
-                    mixed_donor_device if mixed_donor_device.type == "cuda" else torch.device(device_to)
-                )
-                schedule = _MixedSchedule(device_to, prepare_device)
+                self._distorch_cached_assignments = block_assignments
+                self._distorch_placement_key = placement_key
+
+            model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
+            high_precision_loras = getattr(
+                self.model, "_distorch_high_precision_loras", True
+            )
+            schedule = _MixedSchedule(device_to) if streamed else None
 
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
             loading.sort(reverse=True)
             for item in loading:
                 module_size, module_name, module_object, params = unpack_load_item(item)
+                block_target_device = torch.device(
+                    block_assignments.get(module_name, device_to)
+                )
                 if (
                     not unpatch_weights
                     and hasattr(module_object, "comfy_patched_weights")
                     and module_object.comfy_patched_weights is True
                 ):
-                    block_target_device = device_assignments["block_assignments"].get(
-                        module_name, device_to
-                    )
-                    if mixed_donor_device is not None:
-                        block_target_device = _mixed_weight_device(
-                            module_object, mixed_donor_device
-                        )
                     current_module_device = None
                     try:
                         if any(
@@ -1988,25 +2096,16 @@ def register_patched_safetensor_modelpatcher():
                             f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}"
                         )
                         module_object.to(block_target_device)
+                        _pin_cpu_weights(module_object)
 
-                    if mixed_donor_device is not None:
-                        configure_mixed_gemm(
-                            module_object, device_to, prepare_device, schedule
-                        )
+                    if streamed:
+                        configure_mixed_gemm(module_object, device_to, schedule)
 
                     mem_counter += module_size
                     continue
 
-                block_target_device = device_assignments["block_assignments"].get(
-                    module_name, device_to
-                )
-                if mixed_donor_device is not None:
-                    block_target_device = _mixed_weight_device(
-                        module_object, mixed_donor_device
-                    )
-
-                # Move directly to the assigned device. Staging donor weights on the
-                # compute GPU defeats offload and can OOM before the forward wrapper.
+                # Move directly to the assigned device: staging other devices' weights
+                # on the compute GPU would defeat the placement and can OOM.
                 module_object.to(block_target_device)
 
                 # Step 2: Apply LoRa patches on the assigned device.
@@ -2036,7 +2135,7 @@ def register_patched_safetensor_modelpatcher():
 
                 if (
                     not high_precision_loras
-                    and block_target_device == "cpu"
+                    and block_target_device.type == "cpu"
                     and has_patches
                     and model_original_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
                 ):
@@ -2053,29 +2152,32 @@ def register_patched_safetensor_modelpatcher():
                             logger.debug(
                                 f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage"
                             )
+                _pin_cpu_weights(module_object)
 
-                # Step 4: Enable runtime weight casting for offloaded modules. With a
-                # donor, every castable weight is prepared away from where it is stored.
-                if mixed_donor_device is not None:
-                    cast_weights = hasattr(module_object, "comfy_cast_weights")
-                else:
-                    cast_weights = str(block_target_device) != str(device_to)
-                if cast_weights:
+                # Step 4: Enable runtime weight casting for modules stored off the compute GPU.
+                if block_target_device != device_to:
                     module_object.comfy_cast_weights = True
 
-                if mixed_donor_device is not None:
-                    configure_mixed_gemm(
-                        module_object, device_to, prepare_device, schedule
-                    )
+                if streamed:
+                    configure_mixed_gemm(module_object, device_to, schedule)
 
                 # Mark as patched and update memory counter
                 module_object.comfy_patched_weights = True
                 mem_counter += module_size
 
-            if mixed_donor_device is not None:
-                configure_mixed_execution(
-                    self.model.diffusion_model, mixed_donor_device, device_to, schedule
-                )
+            # _load_list skips modules that also own child parameters (a weight_norm conv
+            # keeps its bias while the weight lives in its parametrization), so their own
+            # parameters are moved here as ComfyUI's full load does with model.to().
+            listed = {unpack_load_item(item)[1] for item in loading}
+            for name, module in self.model.named_modules():
+                if name not in listed:
+                    for param in module.parameters(recurse=False):
+                        param.data = param.data.to(device_to)
+
+            if streamed and is_clip_model:
+                configure_streamed_text_encoder(self.model, device_to, schedule)
+            elif streamed:
+                configure_mixed_execution(self.model.diffusion_model, device_to, schedule)
 
             self.model.current_weight_patches_uuid = self.patches_uuid
 
@@ -2123,556 +2225,101 @@ def _extract_clip_head_blocks(raw_block_list, compute_device):
     return head_blocks, distributable_blocks, block_assignments, head_memory
 
 
-def analyze_safetensor_loading(
-    model_patcher, allocations_string, is_clip=False, compute_device=None
-):
+def place_weights(model_patcher, compute_device, streamed, is_clip=False):
+    """Choose a device for every module's weights; returns {module name: device}.
+
+    The compute GPU keeps what is computed there directly: modules ComfyUI
+    cannot cast at runtime, tiny ones and CLIP's embeddings. A streamed model
+    leaves the rest of it to activations; any other model fills it from the
+    head, leaving ComfyUI's inference reserve and room to cast its largest
+    weight there in float32 (a GGUF weight is dequantized whole). The remaining
+    weights are spread over every other device, CPU included, in proportion to
+    their free memory, so that none is paged in from disk while the model runs
+    (see _pin_cpu_weights).
     """
-    Analyze and distribute safetensor model blocks across devices.
-    Supports CLIP head preservation when is_clip=True.
-    """
-    DEVICE_RATIOS_DISTORCH = {}
-    device_table = {}
-    distorch_alloc = ""
-    virtual_vram_str = ""
-    if "#" in allocations_string:
-        distorch_alloc, virtual_vram_str = allocations_string.split("#", 1)
-    else:
-        distorch_alloc = allocations_string
-
-    distorch_alloc = distorch_alloc.strip()
-    if distorch_alloc and not any(
-        "," in allocation for allocation in distorch_alloc.split(";")
-    ):
-        logger.warning(
-            "[MultiGPU DisTorch V2] Ignoring invalid expert allocation %r; "
-            "using virtual-VRAM allocation instead.",
-            distorch_alloc,
-        )
-        distorch_alloc = ""
-
-    metadata_compute_device = (
-        virtual_vram_str.split(";")[0] if virtual_vram_str else "cuda:0"
-    )
-    if compute_device is None:
-        compute_device = metadata_compute_device
-    else:
-        compute_device = str(torch.device(compute_device))
-        if compute_device != metadata_compute_device:
-            logger.warning(
-                "[MultiGPU DisTorch V2] Allocation metadata names %s as the compute "
-                "device, but inference is running on %s; using the runtime device.",
-                metadata_compute_device,
-                compute_device,
-            )
-    logger.debug(f"[MultiGPU DisTorch V2] Compute Device: {compute_device}")
-
-    if not distorch_alloc:
-        if virtual_vram_str:
-            virtual_vram_parts = virtual_vram_str.split(";", 1)
-            virtual_vram_str = ";".join([compute_device, *virtual_vram_parts[1:]])
-        distorch_alloc = calculate_safetensor_vvram_allocation(
-            model_patcher, virtual_vram_str
-        )
-
-    elif any(c in distorch_alloc.lower() for c in ["g", "m", "k", "b"]):
-        distorch_alloc = calculate_fraction_from_byte_expert_string(
-            model_patcher, distorch_alloc
-        )
-    elif "%" in distorch_alloc:
-        distorch_alloc = calculate_fraction_from_ratio_expert_string(
-            model_patcher, distorch_alloc
-        )
-
-    all_devices = get_device_list()
-    present_devices = {
-        item.split(",")[0] for item in distorch_alloc.split(";") if "," in item
-    }
-    for device in all_devices:
-        if device not in present_devices:
-            distorch_alloc += f";{device},0.0"
-
-    eq_line = "=" * 50
-    dash_line = "-" * 50
-    fmt_assign = "{:<18}{:>7}{:>14}{:>10}"
-
-    logger.info(eq_line)
-    logger.info(f"[MultiGPU DisTorch V2] Final Allocation String:\n{distorch_alloc}")
-
-    for allocation in distorch_alloc.split(";"):
-        if "," not in allocation:
-            continue
-        dev_name, fraction = allocation.split(",")
-        fraction = float(fraction)
-        total_mem_bytes = mm.get_total_memory(torch.device(dev_name))
-        alloc_gb = (total_mem_bytes * fraction) / (1024**3)
-        DEVICE_RATIOS_DISTORCH[dev_name] = alloc_gb
-        device_table[dev_name] = {
-            "fraction": fraction,
-            "total_gb": total_mem_bytes / (1024**3),
-            "alloc_gb": alloc_gb,
-        }
-
-    logger.info(eq_line)
-    logger.info("    DisTorch2 Model Device Allocations")
-    logger.info(eq_line)
-
-    fmt_rosetta = "{:<8}{:>9}{:>9}{:>11}{:>10}"
-    logger.info(fmt_rosetta.format("Device", "VRAM GB", "Dev %", "Model GB", "Dist %"))
-    logger.info(dash_line)
-
-    sorted_devices = sorted(device_table.keys(), key=lambda d: (d == "cpu", d))
-
-    total_allocated_model_bytes = sum(
-        d["alloc_gb"] * (1024**3) for d in device_table.values()
-    )
-
-    for dev in sorted_devices:
-        total_dev_gb = device_table[dev]["total_gb"]
-        alloc_fraction = device_table[dev]["fraction"]
-        alloc_gb = device_table[dev]["alloc_gb"]
-
-        dist_ratio_percent = (
-            (alloc_gb * (1024**3) / total_allocated_model_bytes) * 100
-            if total_allocated_model_bytes > 0
-            else 0
-        )
-
-        logger.info(
-            fmt_rosetta.format(
-                dev,
-                f"{total_dev_gb:.2f}",
-                f"{alloc_fraction*100:.1f}%",
-                f"{alloc_gb:.2f}",
-                f"{dist_ratio_percent:.1f}%",
-            )
-        )
-
-    logger.info(dash_line)
-
-    block_summary = {}
-    block_list = []
-    memory_by_type = defaultdict(int)
-    total_memory = 0
-
+    compute_device = str(torch.device(compute_device))
     raw_block_list = model_patcher._load_list()
-    total_memory = sum(unpack_load_item(x)[0] for x in raw_block_list)
-
-    MIN_BLOCK_THRESHOLD = total_memory * 0.0001
-    logger.debug(f"[MultiGPU DisTorch V2] Total model memory: {total_memory} bytes")
-    logger.debug(
-        f"[MultiGPU DisTorch V2] Tiny block threshold (0.01%): {MIN_BLOCK_THRESHOLD} bytes"
-    )
-
-    # CLIP-specific: Extract head blocks and get pre-assignments
-    head_memory = 0
-    block_assignments = {}
     if is_clip:
-        head_blocks, distributable_raw, block_assignments, head_memory = (
-            _extract_clip_head_blocks(raw_block_list, compute_device)
-        )
-        logger.info(
-            f"[MultiGPU DisTorch V2 CLIP] Preserving {len(head_blocks)} head layer(s) ({head_memory/(1024**2):.2f} MB) on compute device: {compute_device}"
-        )
+        _, distributable, assignments, _ = _extract_clip_head_blocks(raw_block_list, compute_device)
     else:
-        distributable_raw = raw_block_list
-
-    # Build all_blocks list for summary (using full raw_block_list)
-    all_blocks = []
-    for item in raw_block_list:
-        module_size, module_name, module_object, params = unpack_load_item(item)
-        block_type = type(module_object).__name__
-        # Populate summary dictionaries
-        block_summary[block_type] = block_summary.get(block_type, 0) + 1
-        memory_by_type[block_type] += module_size
-        all_blocks.append((module_name, module_object, block_type, module_size))
-
-    # Use distributable blocks for actual allocation (for CLIP, this excludes heads)
-    distributable_all_blocks = []
-    for item in distributable_raw:
-        module_size, module_name, module_object, params = unpack_load_item(item)
-        distributable_all_blocks.append(
-            (module_name, module_object, type(module_object).__name__, module_size)
-        )
-
-    block_list = [
-        block
-        for block in distributable_all_blocks
-        if block[3] >= MIN_BLOCK_THRESHOLD
-        and hasattr(block[1], "bias")
-        and hasattr(block[1], "comfy_cast_weights")
-    ]
-    tiny_block_list = [b for b in distributable_all_blocks if b not in block_list]
-
-    logger.debug(f"[MultiGPU DisTorch V2] Total blocks: {len(all_blocks)}")
-    logger.debug(f"[MultiGPU DisTorch V2] Distributable blocks: {len(block_list)}")
-    logger.debug(f"[MultiGPU DisTorch V2] Tiny blocks (<0.01%): {len(tiny_block_list)}")
-
-    logger.info("    DisTorch2 Model Layer Distribution")
-    logger.info(dash_line)
-    fmt_layer = "{:<18}{:>7}{:>14}{:>10}"
-    logger.info(fmt_layer.format("Layer Type", "Layers", "Memory (MB)", "% Total"))
-    logger.info(dash_line)
-
-    for layer_type, count in block_summary.items():
-        mem_mb = memory_by_type[layer_type] / (1024 * 1024)
-        mem_percent = (
-            (memory_by_type[layer_type] / total_memory) * 100 if total_memory > 0 else 0
-        )
-        logger.info(
-            fmt_layer.format(
-                layer_type[:18], str(count), f"{mem_mb:.2f}", f"{mem_percent:.1f}%"
-            )
-        )
-
-    logger.info(dash_line)
-
-    # Distribute blocks sequentially from the tail of the model
-
-    device_assignments = {device: [] for device in DEVICE_RATIOS_DISTORCH}
-    # Create a memory quota for each donor device based on its calculated allocation.
-    donor_devices = list(sorted_devices)
-    donor_quotas = {
-        dev: device_table[dev]["alloc_gb"] * (1024**3) for dev in donor_devices
-    }
-
-    # CLIP-specific: Adjust compute_device quota to account for locked head blocks
-    if is_clip and compute_device in donor_quotas and head_memory > 0:
-        donor_quotas[compute_device] = max(
-            0, donor_quotas[compute_device] - head_memory
-        )
-        logger.debug(
-            f"[MultiGPU DisTorch V2 CLIP] Adjusted {compute_device} quota by -{head_memory/(1024**2):.2f} MB for head preservation"
-        )
-
-    # Iterate from the TAIL of the model, assigning blocks to donors until their quotas are filled.
-    for block_name, module, block_type, block_memory in reversed(block_list):
-        assigned_to_donor = False
-        for donor in donor_devices:
-            if donor_quotas[donor] >= block_memory:
-                block_assignments[block_name] = donor
-                donor_quotas[donor] -= block_memory
-                assigned_to_donor = True
-                break  # Move to the next block
-
-        if (
-            not assigned_to_donor
-        ):  # Note - small rounding errors and tensor-fitting on devices make a block occasionally an orphan. We treat orphans the same as tiny_block_list as they are generally small rounding errors
-            block_assignments[block_name] = compute_device
-
-    if tiny_block_list:
-        for block_name, module, block_type, block_memory in tiny_block_list:
-            block_assignments[block_name] = compute_device
-
-    # Populate device_assignments from the final block_assignments
-    for block_name, device in block_assignments.items():
-        # Find the block in the original list to get all its info
-        for b_name, b_module, b_type, b_mem in all_blocks:
-            if b_name == block_name:
-                device_assignments[device].append((b_name, b_module, b_type, b_mem))
-                break
-
-    logger.info("DisTorch2 Model Final Device/Layer Assignments")
-    logger.info(dash_line)
-    logger.info(fmt_assign.format("Device", "Layers", "Memory (MB)", "% Total"))
-    logger.info(dash_line)
-
-    if tiny_block_list:
-        tiny_block_memory = sum(b[3] for b in tiny_block_list)
-        tiny_mem_mb = tiny_block_memory / (1024 * 1024)
-        tiny_mem_percent = (
-            (tiny_block_memory / total_memory) * 100 if total_memory > 0 else 0
-        )
-        device_label = f"{compute_device} (<0.01%)"
-        logger.info(
-            fmt_assign.format(
-                device_label,
-                str(len(tiny_block_list)),
-                f"{tiny_mem_mb:.2f}",
-                f"{tiny_mem_percent:.1f}%",
-            )
-        )
-        logger.debug(
-            f"[MultiGPU DisTorch V2] Tiny block memory breakdown: {tiny_block_memory} bytes ({tiny_mem_mb:.2f} MB), which is {tiny_mem_percent:.4f}% of total model memory."
-        )
-
-    total_assigned_memory = 0
-    device_memories = {}
-
-    for device, blocks in device_assignments.items():
-        dist_blocks = [b for b in blocks if b[3] >= MIN_BLOCK_THRESHOLD]
-        if not dist_blocks:
-            continue
-
-        device_memory = sum(b[3] for b in dist_blocks)
-        device_memories[device] = device_memory
-        total_assigned_memory += device_memory
-
-    sorted_assignments = sorted(device_memories.keys(), key=lambda d: (d == "cpu", d))
-
-    for dev in sorted_assignments:
-        # Get only the distributed blocks for the count
-        dist_blocks = [
-            b for b in device_assignments[dev] if b[3] >= MIN_BLOCK_THRESHOLD
-        ]
-        if not dist_blocks:
-            continue
-
-        mem_mb = device_memories[dev] / (1024 * 1024)
-        mem_percent = (
-            (device_memories[dev] / total_memory) * 100 if total_memory > 0 else 0
-        )
-        logger.info(
-            fmt_assign.format(
-                dev, str(len(dist_blocks)), f"{mem_mb:.2f}", f"{mem_percent:.1f}%"
-            )
-        )
-
-    logger.info(dash_line)
-
-    return {
-        "device_assignments": device_assignments,
-        "block_assignments": block_assignments,
-    }
-
-
-def parse_memory_string(mem_str):
-    """Parses a memory string (e.g., '4.0g', '512M') and returns bytes."""
-    mem_str = mem_str.strip().lower()
-    match = re.match(r"(\d+\.?\d*)\s*([gmkb]?)", mem_str)
-    if not match:
-        raise ValueError(f"Invalid memory string format: {mem_str}")
-
-    val, unit = match.groups()
-    val = float(val)
-
-    if unit == "g":
-        return val * (1024**3)
-    elif unit == "m":
-        return val * (1024**2)
-    elif unit == "k":
-        return val * 1024
-    else:  # b or no unit
-        return val
-
-
-def calculate_fraction_from_byte_expert_string(model_patcher, byte_str):
-    """Convert byte allocation string (e.g. 'cuda:1,4gb;cpu,*') to fractional VRAM allocation string respecting device order and byte quotas."""
-    raw_block_list = model_patcher._load_list()
-    total_model_memory = sum(unpack_load_item(x)[0] for x in raw_block_list)
-    remaining_model_bytes = total_model_memory
-
-    # Use a list of tuples to preserve the user-defined order
-    parsed_allocations = []
-    wildcard_device = "cpu"  # Default wildcard device
-
-    for allocation in byte_str.split(";"):
-        if "," not in allocation:
-            continue
-        dev_name, val_str = allocation.split(",", 1)
-        is_wildcard = "*" in val_str
-
-        if is_wildcard:
-            wildcard_device = dev_name
-            # Don't add wildcard to the priority list yet
+        distributable, assignments = raw_block_list, {}
+    total_memory = sum(unpack_load_item(item)[0] for item in raw_block_list)
+    blocks = []
+    for item in distributable:
+        size, name, module, _ = unpack_load_item(item)
+        if size >= total_memory * 0.0001 and hasattr(module, "bias") and hasattr(module, "comfy_cast_weights"):
+            blocks.append((name, size))
         else:
-            byte_val = parse_memory_string(val_str)
-            parsed_allocations.append({"device": dev_name, "bytes": byte_val})
+            assignments[name] = compute_device
 
-    final_byte_allocations = defaultdict(int)
-
-    # Process devices with specific byte allocations first, in order
-    for alloc in parsed_allocations:
-        dev = alloc["device"]
-        requested_bytes = alloc["bytes"]
-
-        # Determine the actual bytes to allocate to this device
-        bytes_to_assign = min(requested_bytes, remaining_model_bytes)
-
-        if bytes_to_assign > 0:
-            final_byte_allocations[dev] = bytes_to_assign
-            remaining_model_bytes -= bytes_to_assign
-            logger.info(
-                f"[MultiGPU DisTorch V2] Assigning {bytes_to_assign / (1024**2):.2f}MB of model to {dev} (requested {requested_bytes / (1024**2):.2f}MB)."
-            )
-
-        if remaining_model_bytes <= 0:
-            logger.info(
-                "[MultiGPU DisTorch V2] All model blocks have been allocated. Subsequent devices in the string will receive no assignment."
-            )
-            break
-
-    # Assign any leftover model bytes to the wildcard device
-    if remaining_model_bytes > 0:
-        final_byte_allocations[wildcard_device] += remaining_model_bytes
-        logger.info(
-            f"[MultiGPU DisTorch V2] Assigning remaining {remaining_model_bytes / (1024**2):.2f}MB of model to wildcard device '{wildcard_device}'."
+    room = 0
+    if not streamed:
+        largest_cast = max(
+            (
+                math.prod(module.weight.shape) * 4
+                for _, _, module, _ in map(unpack_load_item, raw_block_list)
+                if isinstance(getattr(module, "weight", None), torch.Tensor)
+            ),
+            default=0,
         )
+        room = (
+            mm.get_free_memory(torch.device(compute_device))
+            - mm.minimum_inference_memory()
+            - largest_cast
+        )
+    kept = sum(size for _, size in blocks)
+    offload = []
+    for name, size in reversed(blocks):
+        if kept > room:
+            offload.append((name, size))
+            kept -= size
+        else:
+            assignments[name] = compute_device
 
-    # Convert the final byte allocations to VRAM fractions
-    allocation_parts = []
-    for dev, bytes_alloc in final_byte_allocations.items():
-        total_device_vram = mm.get_total_memory(torch.device(dev))
-        if total_device_vram > 0:
-            fraction = bytes_alloc / total_device_vram
-            allocation_parts.append(f"{dev},{fraction:.4f}")
+    capacity = {
+        device: mm.get_free_memory(torch.device(device)) * (1 - _STORAGE_RESERVE_FRACTION)
+        for device in get_device_list()
+        if device != compute_device
+    }
+    total_capacity = sum(capacity.values())
+    offload_bytes = sum(size for _, size in offload)
+    share = {
+        device: offload_bytes * free / total_capacity for device, free in capacity.items()
+    } if total_capacity > 0 else {}
+    placed = defaultdict(int)
+    for name, size in reversed(offload):
+        candidates = sorted(share, key=lambda device: placed[device] - share[device])
+        # A weight no device has room for runs from the compute GPU.
+        assignments[name] = next(
+            (device for device in candidates if placed[device] + size <= capacity[device]),
+            compute_device,
+        )
+        placed[assignments[name]] += size
 
-    allocations_string = ";".join(allocation_parts)
-
-    return allocations_string
-
-
-def calculate_fraction_from_ratio_expert_string(model_patcher, ratio_str):
-    """Convert ratio allocation string (e.g. 'cuda:0,25%;cpu,75%') describing model split to fractional VRAM allocation string."""
-    raw_block_list = model_patcher._load_list()
-    total_model_memory = sum(unpack_load_item(x)[0] for x in raw_block_list)
-
-    raw_ratios = {}
-    for allocation in ratio_str.split(";"):
-        if "," not in allocation:
-            continue
-        dev_name, val_str = allocation.split(",", 1)
-        # Assumes the value is a unitless ratio number, ignores '%' for simplicity.
-        value = float(val_str.replace("%", "").strip())
-        raw_ratios[dev_name] = value
-
-    total_ratio_parts = sum(raw_ratios.values())
-    allocation_parts = []
-
-    for dev, ratio_val in raw_ratios.items():
-        bytes_of_model_for_device = (ratio_val / total_ratio_parts) * total_model_memory
-
-        total_vram_of_device = mm.get_total_memory(torch.device(dev))
-
-        if total_vram_of_device > 0:
-            required_fraction = bytes_of_model_for_device / total_vram_of_device
-            allocation_parts.append(f"{dev},{required_fraction:.4f}")
-
-    ratio_values = [str(v) for v in raw_ratios.values()]
-    ratio_string = ":".join(ratio_values)
-
-    normalized_pcts = [(v / total_ratio_parts) * 100 for v in raw_ratios.values()]
-
-    put_parts = []
-    for i, dev_name in enumerate(raw_ratios.keys()):
-        put_parts.append(f"{int(normalized_pcts[i])}% on {dev_name}")
-
-    if len(put_parts) == 1:
-        put_part = put_parts[0]
-    elif len(put_parts) == 2:
-        put_part = f"{put_parts[0]} and {put_parts[1]}"
-    else:
-        put_part = ", ".join(put_parts[:-1]) + f", and {put_parts[-1]}"
-
+    sizes = {name: size for name, size in blocks}
+    per_device = defaultdict(lambda: [0, 0])
+    for name, device in assignments.items():
+        per_device[device][0] += 1
+        per_device[device][1] += sizes.get(name, 0)
     logger.info(
-        f"[MultiGPU DisTorch V2] Ratio(%) Mode - {ratio_str} -> {ratio_string} ratio, put {put_part}"
+        "[MultiGPU DisTorch V2] %s weights%s: %s",
+        type(model_patcher.model).__name__,
+        " (streamed)" if streamed else "",
+        ", ".join(
+            f"{device} {count} layers {nbytes / 1024**2:.0f} MB"
+            for device, (count, nbytes) in sorted(per_device.items(), key=lambda kv: (kv[0] == "cpu", kv[0]))
+        ),
     )
-
-    allocations_string = ";".join(allocation_parts)
-
-    return allocations_string
+    return assignments
 
 
-def calculate_safetensor_vvram_allocation(model_patcher, virtual_vram_str):
-    """Calculate virtual VRAM allocation string for distributed safetensor loading"""
-    recipient_device, vram_amount, donors = virtual_vram_str.split(";")
-    virtual_vram_gb = float(vram_amount)
+def _pin_cpu_weights(module):
+    """Copy a module's CPU weights into pinned RAM.
 
-    eq_line = "=" * 47
-    dash_line = "-" * 47
-    fmt_assign = "{:<8} {:<6} {:>11} {:>9} {:>9}"
-
-    logger.info(eq_line)
-    logger.info("    DisTorch2 Model Virtual VRAM Analysis")
-    logger.info(eq_line)
-    logger.info(
-        fmt_assign.format("Object", "Role", "Original(GB)", "Total(GB)", "Virt(GB)")
+    They then stay resident rather than being paged in from a memory-mapped
+    file, and the compute GPU's copy engine reads them asynchronously.
+    """
+    module._apply(
+        lambda tensor: tensor.pin_memory() if tensor.device.type == "cpu" and not tensor.is_pinned() else tensor,
+        recurse=False,
     )
-    logger.info(dash_line)
-
-    # Calculate recipient VRAM
-    recipient_vram = mm.get_total_memory(torch.device(recipient_device)) / (1024**3)
-    recipient_virtual = recipient_vram + virtual_vram_gb
-
-    logger.info(
-        fmt_assign.format(
-            recipient_device,
-            "recip",
-            f"{recipient_vram:.2f}GB",
-            f"{recipient_virtual:.2f}GB",
-            f"+{virtual_vram_gb:.2f}GB",
-        )
-    )
-
-    # Handle donor devices
-    ram_donors = list(donors.split(","))
-    remaining_vram_needed = virtual_vram_gb
-
-    donor_device_info = {}
-    donor_allocations = {}
-
-    for donor in ram_donors:
-        donor_vram = mm.get_total_memory(torch.device(donor)) / (1024**3)
-        max_donor_capacity = donor_vram
-
-        donation = min(remaining_vram_needed, max_donor_capacity)
-        donor_virtual = donor_vram - donation
-        remaining_vram_needed -= donation
-        donor_allocations[donor] = donation
-
-        donor_device_info[donor] = (donor_vram, donor_virtual)
-        logger.info(
-            fmt_assign.format(
-                donor,
-                "donor",
-                f"{donor_vram:.2f}GB",
-                f"{donor_virtual:.2f}GB",
-                f"-{donation:.2f}GB",
-            )
-        )
-
-    logger.info(dash_line)
-
-    # Calculate model size
-    # Stored bytes, as the block assignment measures them: a quantized weight's
-    # element_size() is its logical dtype, not its int8 or fp8 storage.
-    total_memory = sum(
-        unpack_load_item(item)[0] for item in model_patcher._load_list()
-    )
-
-    model_size_gb = total_memory / (1024**3)
-    new_model_size_gb = max(0, model_size_gb - virtual_vram_gb)
-
-    logger.info(
-        fmt_assign.format(
-            "model",
-            "model",
-            f"{model_size_gb:.2f}GB",
-            f"{new_model_size_gb:.2f}GB",
-            f"-{virtual_vram_gb:.2f}GB",
-        )
-    )
-
-    # Warning if model too large
-    if model_size_gb > (recipient_vram * 0.9):
-        required_offload_gb = model_size_gb - (recipient_vram * 0.9)
-        logger.warning(
-            f"\n\n[MultiGPU DisTorch V2] Model size ({model_size_gb:.2f}GB) is larger than 90% of available VRAM on: {recipient_device} ({recipient_vram * 0.9:.2f}GB)."
-        )
-        logger.warning(
-            f"[MultiGPU DisTorch V2] To prevent an OOM error, set 'virtual_vram_gb' to at least {required_offload_gb:.2f}.\n\n"
-        )
-
-    new_on_recipient = max(0, model_size_gb - virtual_vram_gb)
-
-    # Build allocation string
-    allocation_parts = []
-    recipient_percent = new_on_recipient / recipient_vram
-    allocation_parts.append(f"{recipient_device},{recipient_percent:.4f}")
-
-    for donor in ram_donors:
-        donor_vram = donor_device_info[donor][0]
-        donor_percent = donor_allocations[donor] / donor_vram
-        allocation_parts.append(f"{donor},{donor_percent:.4f}")
-
-    allocations_string = ";".join(allocation_parts)
-    return allocations_string

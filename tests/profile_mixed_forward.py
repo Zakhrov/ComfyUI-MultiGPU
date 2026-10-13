@@ -1,7 +1,7 @@
 """Profile one steady-state sampling step of a DisTorch2 model on both GPUs.
 
 Run from anywhere with ComfyUI's venv:
-    .venv/bin/python custom_nodes/ComfyUI-MultiGPU/tests/profile_mixed_forward.py --donor cuda:1
+    .venv/bin/python custom_nodes/ComfyUI-MultiGPU/tests/profile_mixed_forward.py
 Re-analyze a saved trace without a GPU:
     ... --analyze /tmp/mixed_forward.trace.json
 
@@ -241,11 +241,11 @@ def run(args):
         ("_run_staged_linear", "mgpu::linear_gemm"),
         ("_run_fused_mlp", "mgpu::fused_mlp"),
         ("_run_quantized_linear_on_compute", "mgpu::quant_linear"),
-        ("_run_donor_prepared_linear_on_compute", "mgpu::donor_prepared_linear"),
+        ("_run_prepared_linear_on_compute", "mgpu::prepared_linear"),
         ("_run_tiled_linear_on_compute", "mgpu::tiled_linear"),
         ("_run_attention_on_compute", "mgpu::attention"),
         ("_stage_linear", "mgpu::stage_next_weights"),
-        ("_compute_budget", "mgpu::budget_sync"),
+        ("_compute_budget", "mgpu::budget"),
         ("_run_tiled_conv_on_compute", "mgpu::conv"),
     ):
         annotate(name, label)
@@ -253,14 +253,12 @@ def run(args):
     if args.gguf:
         loader = nodes.NODE_CLASS_MAPPINGS["UnetLoaderGGUFDisTorch2MultiGPU"]()
         (model,) = loader.override(
-            unet_name=args.gguf, compute_device="cuda:0", virtual_vram_gb=args.virtual_vram,
-            donor_device=args.donor, expert_mode_allocations="", eject_models=True,
+            unet_name=args.gguf, compute_device="cuda:0", eject_models=True,
         )
     else:
         loader = nodes.NODE_CLASS_MAPPINGS["UNETLoaderDisTorch2MultiGPU"]()
         (model,) = loader.override(
-            unet_name=args.unet, weight_dtype="default", compute_device="cuda:0",
-            virtual_vram_gb=args.virtual_vram, donor_device=args.donor, expert_mode_allocations="", eject_models=True,
+            unet_name=args.unet, weight_dtype="default", compute_device="cuda:0", eject_models=True,
         )
 
     latent = torch.zeros(1, 16, args.size // 8, args.size // 8)
@@ -299,18 +297,16 @@ def run(args):
         callback=callback, disable_pbar=True, seed=0,
     )
     print(f"result mean {result.float().mean():.6f} std {result.float().std():.6f}", flush=True)
-    print(f"\nunprofiled step 2 wall: see the 'step 2 finished' line above (donor={args.donor})")
+    print("\nunprofiled step 2 wall: see the 'step 2 finished' line above")
     if not args.no_profile:
         analyze(args.trace)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--donor", default="cuda:1", help="device that holds activations, e.g. cuda:1 or cpu")
     parser.add_argument("--unet", default="z_image_turbo_int8_convrot.safetensors")
     parser.add_argument("--gguf", default=None, help="GGUF unet name, e.g. unsloth/z-image-turbo-Q8_0.gguf")
     parser.add_argument("--size", type=int, default=1024)
-    parser.add_argument("--virtual-vram", type=float, default=4.0)
     parser.add_argument("--ctx-len", type=int, default=64)
     parser.add_argument("--ctx-dim", type=int, default=2560)
     parser.add_argument("--trace", default="/tmp/mixed_forward.trace.json")

@@ -775,7 +775,6 @@ from .wrappers import (
     override_class_clip,
     override_class_clip_no_device,
     override_class_with_distorch_gguf,
-    override_class_with_distorch_gguf_v2 as override_class_with_distorch_gguf_v2,
     override_class_with_distorch_clip,
     override_class_with_distorch_clip_no_device,
     override_class_with_distorch as override_class_with_distorch,
@@ -785,8 +784,6 @@ from .wrappers import (
 )
 from .distorch_2 import (
     register_patched_safetensor_modelpatcher as register_patched_safetensor_modelpatcher,
-    analyze_safetensor_loading as analyze_safetensor_loading,
-    calculate_safetensor_vvram_allocation as calculate_safetensor_vvram_allocation,
 )
 
 from .checkpoint_multigpu import (
