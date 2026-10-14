@@ -29,8 +29,10 @@ def load_distorch_module():
     quant_ops.QuantizedTensor = type("QuantizedTensor", (torch.Tensor,), {})
     ops = types.ModuleType("comfy.ops")
     ops.dense_linear = functional.linear
-    ops._packed_conv_wanted = lambda *_: False
-    ops._direct_conv_wanted = lambda *_: False
+    ops._rdna1_conv_wanted = lambda *_: False
+    ops.conv_nd = lambda x, weight, bias, stride, padding, dilation: (
+        functional.conv3d if weight.dim() == 5 else functional.conv2d
+    )(x, weight, bias, stride, padding, dilation)
     ops._linear_conv_wanted = lambda *_: False
     sd1_clip = types.ModuleType("comfy.sd1_clip")
     sd1_clip.SDClipModel = type("SDClipModel", (torch.nn.Module,), {})
@@ -217,16 +219,16 @@ class TestHipDonorGemmOffload(unittest.TestCase):
                                      stride=(1, 2, 2), padding=1)
         packed_on, kitchen_padding = [], []
 
-        def dense_conv(x, weight, bias, stride, padding, dilation):
+        def conv_nd(x, weight, bias, stride, padding, dilation):
             kitchen_padding.append(padding)
-            return comfy_kitchen.fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
+            return comfy_kitchen.fp16_packed_conv3d(x, weight, bias, stride, (padding,) * 3, dilation)
 
         module.to(storage)
         self.assertTrue(self.distorch.configure_mixed_gemm(module, compute))
         with (
-            mock.patch.object(self.distorch.comfy.ops, "_packed_conv_wanted",
-                              lambda conv, x, weight: packed_on.append(weight.device) or True),
-            mock.patch.object(self.distorch.comfy.ops, "dense_conv", dense_conv, create=True),
+            mock.patch.object(self.distorch.comfy.ops, "_rdna1_conv_wanted",
+                              lambda x, weight: packed_on.append(weight.device) or True),
+            mock.patch.object(self.distorch.comfy.ops, "conv_nd", conv_nd),
             mock.patch.object(self.distorch, "_CONV_TILE_BUDGET_BYTES", 1 << 18),
             mock.patch.object(self.distorch.mm, "get_free_memory", lambda *_: 1 << 40),
         ):
@@ -234,7 +236,7 @@ class TestHipDonorGemmOffload(unittest.TestCase):
 
         self.assertEqual(packed_on, [compute])
         self.assertGreater(len(kitchen_padding), 1)
-        self.assertEqual(set(kitchen_padding), {(0, 0, 0)})
+        self.assertEqual(set(kitchen_padding), {0})
         self.assertEqual(output.device, compute)
         error = (output.to(compute).float() - expected.float()).norm() / expected.float().norm()
         self.assertLess(error.item(), 2e-3)

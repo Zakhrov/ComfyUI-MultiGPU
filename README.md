@@ -6,7 +6,7 @@ A fork of [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-Mult
 > **AMD ROCm only.** The changes in this fork are developed and tested exclusively on AMD GPUs with ROCm (HIP builds of PyTorch). They are **not** tested on, and should be assumed **not to work** on, NVIDIA CUDA, Intel XPU, Apple MPS, DirectML or any other torch backend. If you are not on ROCm, use [upstream ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) instead.
 
 > [!CAUTION]
-> **Requires a custom, unofficial Comfy Kitchen HIP backend.** Streamed execution depends on the `hip-bringup` branch of a Comfy Kitchen fork: [Zakhrov/comfy-kitchen@hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup). This backend is experimental, is not part of official Comfy Kitchen releases, and is not supported by the Comfy Kitchen or ComfyUI maintainers. Expect breakage when ComfyUI or Comfy Kitchen update. Do not report problems caused by it to those projects.
+> **Requires a custom, unofficial Comfy Kitchen HIP backend.** Streamed execution depends on the `rdna1` backend in the `rdna1-backend` branch of a Comfy Kitchen fork: [Zakhrov/comfy-kitchen@rdna1-backend](https://github.com/Zakhrov/comfy-kitchen/tree/rdna1-backend), which the [RDNA1 ComfyUI fork](https://github.com/Zakhrov/ComfyUI-RDNA1-ROCM) carries as a submodule. This backend is experimental, is not part of official Comfy Kitchen releases, and is not supported by the Comfy Kitchen or ComfyUI maintainers. Expect breakage when ComfyUI or Comfy Kitchen update. Do not report problems caused by it to those projects.
 
 ## What's different from upstream
 
@@ -39,10 +39,10 @@ A diffusion model streams when it would take more than half of the compute GPU's
 
 ### Relationship to comfy-kitchen's rdna1 backend
 
-On an RDNA1 compute GPU, streamed execution runs on comfy-kitchen's `rdna1` backend (its `vega` twin on a Vega compute GPU), not on the plain eager backend:
+On an RDNA1 compute GPU, streamed execution runs on comfy-kitchen's `rdna1` backend, not on the plain eager backend:
 
 - it is enabled only on the HIP software-GEMM path with `--use-ck-attention`, which needs the backend's INT8 attention; the eager backend has none on gfx1010;
-- streamed linears run the backend's packed fp16 GEMM, convs its implicit-GEMM conv, and SLA its `int8_block_sparse_attention`.
+- streamed linears run the backend's packed fp16 GEMM (GGUF Q8_0 and Q4_K weights its `q8_0_linear` and `q4_k_linear`), convs its implicit-GEMM conv, and SLA its `int8_block_sparse_attention`.
 
 The RDNA1 ComfyUI fork routes the dense layers to the same kernels when a model fits without streaming. A donor GPU only stores weights; every op runs on the compute GPU.
 
@@ -54,6 +54,8 @@ The compute GPU must use the HIP software-GEMM path:
 - RDNA1: `gfx1010`–`gfx1012`
 - RDNA2: `gfx1030`–`gfx1036`
 
+Comfy Kitchen's `rdna1` backend only has kernels for `gfx1010`; on the others streamed layers run on torch ops.
+
 ### How it works
 
 - Activations live on the compute GPU. An op whose result does not fit in its free VRAM runs in slices whose results are copied to pinned system RAM as they complete. An op that reads a spilled tensor streams it back in slices and keeps its result on the compute GPU when it fits. Spills never go to another GPU: an APU would copy them with its shaders, where the compute GPU's copy engine does it for free.
@@ -63,7 +65,8 @@ The compute GPU must use the HIP software-GEMM path:
 - Token-wise MLPs (SwiGLU `w1`/`w2`/`w3`, `fc1`/`fc2` pairs and `Sequential` linear/activation MLPs) run whole on the compute GPU in token chunks, so their wide hidden activation is never materialized in full.
 - Attention runs in one call when Q, K and V are on the compute GPU. On out-of-memory, or for spilled tensors, it runs in chunks of whole heads, and the chunk size is kept until the model reloads.
 - ComfyUI quantized safetensors layers (int8, fp8) send their packed weight to the compute GPU and run their own quantized matmul there. Plain LoRAs on GGUF models run as two thin GEMMs instead of being merged into the dequantized weight on every call.
-- Conv2d and Conv3d run in tiles of at most 128 MiB on the compute GPU; fp16 convs run on Comfy Kitchen's implicit-GEMM conv where ComfyUI would use it.
+- GGUF Q8_0 and Q4_K linears are staged as their raw blocks (Q8_0 half, Q4_K under a third of the float16 weight's bytes) and run on Comfy Kitchen's `q8_0_linear` / `q4_k_linear`, which read the blocks in the packed GEMM without dequantizing the weight: 1.15-1.2x faster than the float16 GEMM on `gfx1010`. Plain LoRAs on these layers run beside them as two thin GEMMs; any other patch makes the layer dequantize so the loader can merge it.
+- Conv2d and Conv3d run in tiles of at most 128 MiB on the compute GPU, each tile through ComfyUI's `comfy.ops.conv_nd`, so they take the same Comfy Kitchen conv kernels as an unstreamed model on the RDNA1 ComfyUI fork.
 - VAEs and text encoders are never streamed; their weights are placed as above and cast layer by layer.
 
 ### Benchmark
@@ -91,7 +94,7 @@ Both produced matching videos.
 - Without MultiGPU, Z-Image Turbo only runs with `--lowvram`: 111.8 / 33.2 s, 3.37 s/it (Q8_0 GGUF UNet). The MultiGPU run loads `z_image_turbo_int8_convrot.safetensors` instead; both use the Qwen3-4B Q8_0 GGUF text encoder.
 - With the 5600M alone (CPU donor), the MultiGPU Z-Image run took 91.9 / 28.7 s at 3.07 s/it. With sub-quadratic attention instead of ck-attention streaming is disabled, 4.4 GB of the UNet stays on the GPU, and it took 64.8 / 29.5 s at 2.90 s/it.
 - With the Q8_0 GGUF UNet on `UnetLoaderGGUFDisTorch2MultiGPU` instead, the MultiGPU Z-Image run took 56.4 / 30.3 s at 3.00 s/it, 3.0 GB warm (UNet streamed: about 3 GB on the iGPU, 3.4-3.9 GB in RAM): within 5% of the safetensors run once loaded.
-- The iGPU only holds weights. Every op runs on the compute GPU, so comfy-kitchen's `vega` backend registers but serves nothing here.
+- The iGPU only holds weights. Every op runs on the compute GPU.
 - SD1.5 and SDXL checkpoints carry their VAE; for the MultiGPU VAE loader each was extracted unchanged to its own file.
 
 ## Installation
@@ -102,7 +105,7 @@ ComfyUI-Manager installs upstream, not this fork. Install manually:
    ```bash
    git clone https://github.com/Zakhrov/ComfyUI-MultiGPU
    ```
-2. For streamed execution, install the Comfy Kitchen HIP backend from [Zakhrov/comfy-kitchen@hip-bringup](https://github.com/Zakhrov/comfy-kitchen/tree/hip-bringup) into the same Python environment as ComfyUI, replacing any official `comfy-kitchen` package.
+2. For streamed execution, use the [RDNA1 ComfyUI fork](https://github.com/Zakhrov/ComfyUI-RDNA1-ROCM), whose install builds the Comfy Kitchen `rdna1` backend from its submodule, or install [Zakhrov/comfy-kitchen@rdna1-backend](https://github.com/Zakhrov/comfy-kitchen/tree/rdna1-backend) with `COMFY_HIP_ARCHS=gfx1010` into the same Python environment as ComfyUI, replacing any official `comfy-kitchen` package.
 3. Run ComfyUI with a ROCm build of PyTorch.
 
 ## Nodes

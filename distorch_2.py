@@ -628,8 +628,11 @@ def _gemm_weight_dtype(dtype, compute_device):
 
 def _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up):
     if weight.dtype == torch.uint8:
-        # a GGUF Q8_0 weight staged as its raw blocks (see _q8_0_native)
-        output_chunk = comfy.ops.quant_ops.ck.q8_0_linear(input_chunk, weight, weight.shape[0], bias)
+        # a GGUF weight staged as its raw blocks (see _gguf_native), Q8_0's 34 bytes or
+        # Q4_K's 18 bytes per 32 elements
+        op = comfy.ops.quant_ops.ck.q8_0_linear if weight.shape[1] * 32 == input_chunk.shape[-1] * 34 \
+            else comfy.ops.quant_ops.ck.q4_k_linear
+        output_chunk = op(input_chunk, weight, weight.shape[0], bias)
     elif weight.dtype != input_chunk.dtype and not comfy.ops._packed_linear_wanted(input_chunk, weight):
         # A float16 weight (see _gemm_weight_dtype) on a GEMM too small for the packed kernel.
         output_chunk = comfy.ops.dense_linear(input_chunk, weight.to(input_chunk.dtype), bias)
@@ -796,7 +799,7 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
     The output is an activation (see _activation_empty). Every spatial dim but
     the width is tiled; each tile copies only the input it reads, including the
     kernel halo, and padding is applied on the compute GPU. Tiles run on
-    Kitchen's fp16 implicit-GEMM conv where ComfyUI would use it.
+    comfy.ops.conv_nd, which takes Kitchen's rdna1 conv kernels where ComfyUI would.
     """
     stride, dilation = conv.stride, conv.dilation
     batch, channels, *size = input_tensor.shape
@@ -816,10 +819,8 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
     weight_buffer = torch.empty(
         (channels_per_tile, *weight.shape[1:]), device=compute_device, dtype=weight.dtype
     )
-    direct = comfy.ops._direct_conv_wanted(conv, input_tensor, weight_buffer)
-    packed = not direct and comfy.ops._packed_conv_wanted(conv, input_tensor, weight_buffer)
-    # MIOpen may lower the conv to a GEMM over an im2col workspace; Kitchen's conv has none.
-    workspace = 0 if packed or direct else weight[0].numel()
+    # MIOpen may lower the conv to a GEMM over an im2col workspace; Kitchen's convs have none.
+    workspace = 0 if comfy.ops._rdna1_conv_wanted(input_tensor, weight_buffer) else weight[0].numel()
 
     def input_extent(chunk, dim):
         return (chunk[dim] - 1) * stride[dim] + span[dim]
@@ -850,8 +851,6 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
     resident = channels_per_tile == out_channels
     if resident:
         weight_buffer.copy_(weight, non_blocking=True)
-    conv_op = torch.nn.functional.conv3d if dims == 3 else torch.nn.functional.conv2d
-    no_padding = (0,) * dims
     tile_starts = [range(0, out_size[dim], chunk[dim]) for dim in range(dims)]
 
     with torch.cuda.device_of(input_buffer):
@@ -889,12 +888,7 @@ def _run_tiled_conv_on_compute(conv, input_tensor, weight, bias, padding, comput
                         weight_tile.copy_(weight[start:end], non_blocking=True)
                     target[1] = slice(start, end)
                     bias_tile = None if bias is None else bias[start:end]
-                    if direct:
-                        result = comfy.ops.direct_conv(input_tile, weight_tile, bias_tile, stride, no_padding, dilation)
-                    elif packed:
-                        result = comfy.ops.dense_conv(input_tile, weight_tile, bias_tile, stride, no_padding, dilation)
-                    else:
-                        result = conv_op(input_tile, weight_tile, bias_tile, stride, 0, dilation)
+                    result = comfy.ops.conv_nd(input_tile, weight_tile, bias_tile, stride, 0, dilation)
                     output[tuple(target)].copy_(result, non_blocking=True)
 
     return output
@@ -1202,26 +1196,38 @@ class _MixedSchedule:
 _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype ready")
 
 
-def _q8_0_native(module, compute_device):
-    """Whether a GGUF linear's Q8_0 weight runs on Comfy Kitchen's q8_0_linear, which reads
-    its blocks in the packed GEMM: staged as stored, half the bytes of the dequantized
-    float16 weight, and 1.15-1.2x faster than its GEMM on gfx1010. Weights with GGUF
-    patches still dequantize, so the loader merges them."""
+# GGUF weight types Comfy Kitchen's packed GEMM reads as stored, and its op for each.
+_GGUF_NATIVE_OPS = {"Q8_0": "q8_0_linear", "Q4_K": "q4_k_linear"}
+
+
+def _gguf_native(module, compute_device):
+    """Whether a GGUF linear's Q8_0 or Q4_K weight runs on Comfy Kitchen's q8_0_linear or
+    q4_k_linear, which read its blocks in the packed GEMM: staged as stored (Q8_0 half, Q4_K
+    under a third of the dequantized float16 weight's bytes), 1.15-1.2x faster than its GEMM
+    on gfx1010. Its patches are checked as it is staged (_gguf_native_lora)."""
     weight = module.weight
+    op = _GGUF_NATIVE_OPS.get(getattr(getattr(weight, "tensor_type", None), "name", None))
     return (
-        getattr(weight, "tensor_type", None) is not None
-        and weight.tensor_type.name == "Q8_0"
-        and not getattr(weight, "patches", ())
+        op is not None
         and getattr(comfy.ops, "_CK_PACKED", False)
-        and hasattr(comfy.ops.quant_ops.ck, "q8_0_linear")
+        and hasattr(comfy.ops.quant_ops.ck, op)
         and comfy.ops.quant_ops.ck.fp16_packed_linear_is_accelerated(torch.device(compute_device))
     )
+
+
+def _gguf_native_lora(module):
+    """A native GGUF weight's patches as low-rank (down, up, scale) LoRAs, which run beside
+    the staged blocks as for a dequantized weight, or None when a patch is not a plain LoRA
+    and the loader has to merge it into the dequantized weight."""
+    patches = [patch for patch_list, _ in getattr(module.weight, "patches", ()) for patch in patch_list]
+    lora = _plain_lora_patches(patches)
+    return lora if lora or not patches else None
 
 
 def _staged_weight_bytes(module, dtype):
     if module._mgpu_quantized:
         return mm.module_size(module)
-    if module._mgpu_q8_0:
+    if module._mgpu_gguf_native:
         return module.weight.nbytes
     return module.out_features * module.in_features * _gemm_weight_dtype(dtype, module._mgpu_compute_device).itemsize
 
@@ -1272,10 +1278,10 @@ def _stage_linear(module, dtype, schedule=None):
                 if module._mgpu_quantized:
                     weight, bias, lora = module.weight, module.bias, ()
                     offload_state = None
-                elif module._mgpu_q8_0:
+                elif module._mgpu_gguf_native and (native_lora := _gguf_native_lora(module)) is not None:
                     weight = module.weight.as_subclass(torch.Tensor).reshape(module.out_features, -1)
-                    lora, offload_state = (), None
                     bias = None if module.bias is None else module.bias.as_subclass(torch.Tensor)
+                    lora, offload_state = native_lora, None
                 else:
                     weight, bias, offload_state, lora = _prepare_linear(
                         module, _gemm_weight_dtype(dtype, compute_device), compute_device
@@ -1537,7 +1543,7 @@ def configure_mixed_gemm(module, compute_device, schedule=None):
 
     # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
     module._mgpu_quantized = getattr(module, "layout_type", None) is not None
-    module._mgpu_q8_0 = not module._mgpu_quantized and _q8_0_native(module, compute_device)
+    module._mgpu_gguf_native = not module._mgpu_quantized and _gguf_native(module, compute_device)
     module._mgpu_schedule = schedule
     module._mgpu_staged = None
     # The weight a fused MLP staged for this linear while it runs (see _run_fused_mlp).
