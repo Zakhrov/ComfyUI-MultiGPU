@@ -627,10 +627,14 @@ def _gemm_weight_dtype(dtype, compute_device):
 
 
 def _linear_on_compute(input_chunk, weight, bias, lora_down, lora_up):
-    if weight.dtype != input_chunk.dtype and not comfy.ops._packed_linear_wanted(input_chunk, weight):
+    if weight.dtype == torch.uint8:
+        # a GGUF Q8_0 weight staged as its raw blocks (see _q8_0_native)
+        output_chunk = comfy.ops.quant_ops.ck.q8_0_linear(input_chunk, weight, weight.shape[0], bias)
+    elif weight.dtype != input_chunk.dtype and not comfy.ops._packed_linear_wanted(input_chunk, weight):
         # A float16 weight (see _gemm_weight_dtype) on a GEMM too small for the packed kernel.
-        weight = weight.to(input_chunk.dtype)
-    output_chunk = comfy.ops.dense_linear(input_chunk, weight, bias)
+        output_chunk = comfy.ops.dense_linear(input_chunk, weight.to(input_chunk.dtype), bias)
+    else:
+        output_chunk = comfy.ops.dense_linear(input_chunk, weight, bias)
     if lora_down is not None:
         output_chunk.addmm_(input_chunk @ lora_down.t(), lora_up.t())
     return output_chunk
@@ -1198,9 +1202,27 @@ class _MixedSchedule:
 _StagedLinear = namedtuple("_StagedLinear", "weight bias lora_down lora_up dtype ready")
 
 
+def _q8_0_native(module, compute_device):
+    """Whether a GGUF linear's Q8_0 weight runs on Comfy Kitchen's q8_0_linear, which reads
+    its blocks in the packed GEMM: staged as stored, half the bytes of the dequantized
+    float16 weight, and 1.15-1.2x faster than its GEMM on gfx1010. Weights with GGUF
+    patches still dequantize, so the loader merges them."""
+    weight = module.weight
+    return (
+        getattr(weight, "tensor_type", None) is not None
+        and weight.tensor_type.name == "Q8_0"
+        and not getattr(weight, "patches", ())
+        and getattr(comfy.ops, "_CK_PACKED", False)
+        and hasattr(comfy.ops.quant_ops.ck, "q8_0_linear")
+        and comfy.ops.quant_ops.ck.fp16_packed_linear_is_accelerated(torch.device(compute_device))
+    )
+
+
 def _staged_weight_bytes(module, dtype):
     if module._mgpu_quantized:
         return mm.module_size(module)
+    if module._mgpu_q8_0:
+        return module.weight.nbytes
     return module.out_features * module.in_features * _gemm_weight_dtype(dtype, module._mgpu_compute_device).itemsize
 
 
@@ -1250,6 +1272,10 @@ def _stage_linear(module, dtype, schedule=None):
                 if module._mgpu_quantized:
                     weight, bias, lora = module.weight, module.bias, ()
                     offload_state = None
+                elif module._mgpu_q8_0:
+                    weight = module.weight.as_subclass(torch.Tensor).reshape(module.out_features, -1)
+                    lora, offload_state = (), None
+                    bias = None if module.bias is None else module.bias.as_subclass(torch.Tensor)
                 else:
                     weight, bias, offload_state, lora = _prepare_linear(
                         module, _gemm_weight_dtype(dtype, compute_device), compute_device
@@ -1511,6 +1537,7 @@ def configure_mixed_gemm(module, compute_device, schedule=None):
 
     # ComfyUI sets layout_type on layers whose weight is quantized (int8, fp8, ...).
     module._mgpu_quantized = getattr(module, "layout_type", None) is not None
+    module._mgpu_q8_0 = not module._mgpu_quantized and _q8_0_native(module, compute_device)
     module._mgpu_schedule = schedule
     module._mgpu_staged = None
     # The weight a fused MLP staged for this linear while it runs (see _run_fused_mlp).
